@@ -138,6 +138,12 @@ class LwI(BaseLearner):
                 self._old_network.set_layer_weights(layer, W_fused)
 
     def _compute_similarity(self, W_old, W_new):
+        # Nếu weight chỉ có 1 chiều -> thêm chiều batch
+        if W_old.dim() == 1:
+            W_old = W_old.unsqueeze(0)
+        if W_new.dim() == 1:
+            W_new = W_new.unsqueeze(0)
+
         W_old_norm = F.normalize(W_old, p=2, dim=1)
         W_new_norm = F.normalize(W_new, p=2, dim=1)
         return torch.matmul(W_old_norm, W_new_norm.t())
