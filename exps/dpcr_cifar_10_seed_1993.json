@@ -7,7 +7,7 @@
     "cosine": true,
     "init_cls": 10,
     "increment": 10,
-    "model_name": "lwf",
+    "model_name": "lwi",
     "convnet_type": "resnet18",
     "batch_size" : 128,
     "device": ["0"],
