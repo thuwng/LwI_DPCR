@@ -185,14 +185,20 @@ class LwI(BaseLearner):
         else:
             raise ValueError(f"Unsupported weight dim: {W.shape}")
 
-    def _compute_similarity(self, W_old_2d, W_new_2d):
-        """
-        Chuẩn hóa từng hàng (kênh out), rồi cosine similarity giữa hàng.
-        Output: (n_out_old, n_out_new)
-        """
-        W_old_norm = F.normalize(W_old_2d, p=2, dim=1)
-        W_new_norm = F.normalize(W_new_2d, p=2, dim=1)
-        return torch.matmul(W_old_norm, W_new_norm.t()).t().t()  # đảm bảo (n_out_old, n_out_new)
+    def _compute_similarity(self, W_old, W_new, batch_size=4096, use_cpu=True):
+        if use_cpu:
+            W_old = W_old.cpu()
+            W_new = W_new.cpu()
+        W_old_norm = F.normalize(W_old, p=2, dim=1)
+        W_new_norm = F.normalize(W_new, p=2, dim=1)
+
+        n_old = W_old_norm.size(0)
+        sims = []
+        for start in range(0, n_old, batch_size):
+            end = min(start + batch_size, n_old)
+            sims.append(torch.matmul(W_old_norm[start:end], W_new_norm.t()))
+        sims = torch.cat(sims, dim=0)
+        return sims.to(W_old.device if not use_cpu else "cpu")
 
     def _compute_permutation_matrix(self, R, layer):
         """
