@@ -28,7 +28,6 @@ def extract_channel_reprs_from_state(state_dict, layer_keys=None, device='cpu'):
     If None: choose keys that look like conv or linear weights.
     """
     reprs = {}
-    edge_reprs = {}
     for k, v in state_dict.items():
         if layer_keys is not None and k not in layer_keys:
             continue
@@ -37,28 +36,36 @@ def extract_channel_reprs_from_state(state_dict, layer_keys=None, device='cpu'):
             W = v.cpu()
             if W.ndim == 4:
                 # conv weight: [out_c, in_c, kh, kw] -> per out channel vector
-                out_c, in_c, kh, kw = W.shape
+                out_c = W.shape[0]
                 vecs = W.view(out_c, -1).clone()  # (out_c, in_c*kh*kw)
                 reprs[k] = vecs.to(device)
-                edge_vecs = W.mean(dim=(2, 3))  # (out_c, in_c)
-                edge_reprs[k] = edge_vecs.to(device)
             elif W.ndim == 2:
-                out_c, in_c = W.shape
-                reprs[k] = W.clone().to(device)
-                edge_reprs[k] = W.clone().to(device)
+                out_c = W.shape[0]
+                vecs = W.clone()  # (out_c, in_c)
+                reprs[k] = vecs.to(device)
             else:
                 # skip other shapes
                 continue
-    return reprs, edge_reprs
+    return reprs
 
 def compute_cost_matrix(E_old, E_new, metric='euclid'):
+    """
+    E_old: (n_old, d), E_new: (n_new, d)
+    return cost matrix C (n_old, n_new)
+    """
+    # convert to float tensors
+    A = E_old
+    B = E_new
+    # compute squared euclidean distances: ||a-b||^2 = ||a||^2 + ||b||^2 - 2 a.b
     with torch.no_grad():
-        # Tính khoảng cách dựa trên edges
-        C = torch.zeros(E_old.shape[0], E_new.shape[0]).to(E_old.device)
-        for i in range(E_old.shape[0]):
-            for j in range(E_new.shape[0]):
-                C[i, j] = torch.norm(E_old_edges[i] - E_new_edges[j], p=2) ** 2
-        return C
+        an = (A**2).sum(dim=1).unsqueeze(1)  # (n_old,1)
+        bn = (B**2).sum(dim=1).unsqueeze(0)  # (1,n_new)
+        C = an + bn - 2.0 * (A @ B.t())
+        # ensure non-negative numerical
+        C = torch.clamp(C, min=0.0)
+        # optional: take sqrt to get euclidean
+        C = torch.sqrt(C + 1e-12)
+    return C
 
 def greedy_match_from_cost(C):
     """
@@ -68,19 +75,22 @@ def greedy_match_from_cost(C):
     Returns:
         perm_old2new: length n_old, with -1 for unmatched old channels (if n_old>n_new)
     """
-    from scipy.optimize import linear_sum_assignment
-    if tau <= 0.1:  # Hungarian
-        row_ind, col_ind = linear_sum_assignment(C.cpu().numpy())
-        perm = -1 * np.ones(C.shape[0], dtype=np.int64)
-        perm[row_ind] = col_ind
-    else:  # Sinkhorn (giả lập đơn giản)
-        P = torch.ones_like(C) / C.shape[1]
-        for _ in range(max_iter):
-            P *= torch.exp(-C / tau)
-            P /= P.sum(dim=1, keepdim=True)
-            P /= P.sum(dim=0, keepdim=True)
-        perm = P.argmax(dim=1).cpu().numpy()
-    return perm
+    n_old, n_new = C.shape
+    C_np = C.cpu().numpy()
+    assigned_new = set()
+    perm = -1 * np.ones(n_old, dtype=np.int64)
+    # Greedy: pick smallest cost pair iteratively
+    # Build list of (cost, old, new), sort ascending
+    idxs = np.dstack(np.unravel_index(np.argsort(C_np.ravel()), (n_old, n_new)))[0]
+    # iterate sorted pairs
+    for old_idx, new_idx in idxs:
+        if perm[old_idx] == -1 and new_idx not in assigned_new:
+            perm[old_idx] = int(new_idx)
+            assigned_new.add(int(new_idx))
+        # early stop if all assigned
+        if len(assigned_new) >= min(n_old, n_new):
+            break
+    return perm  # -1 means unassigned
 
 def apply_permutation_and_fuse_state(state_old, state_new, layer_permutations, k=0.6, device='cpu'):
     """
@@ -161,25 +171,28 @@ def perform_lwi_fusion(old_model, new_model, args, device):
     - apply permutation & fuse
     - returns fused_state_dict (which should be loaded into new_model)
     """
+    # Save state dicts
     state_old = {k: v.detach().cpu().clone() for k, v in old_model.state_dict().items()}
     state_new = {k: v.detach().cpu().clone() for k, v in new_model.state_dict().items()}
+
+    # choose keys to match
     match_keys = select_weight_keys_for_matching(state_old)
-    reprs_old, edge_reprs_old = extract_channel_reprs_from_state(state_old, match_keys, device)
-    reprs_new, edge_reprs_new = extract_channel_reprs_from_state(state_new, match_keys, device)
+
+    # extract per-layer reprs
+    reprs_old = extract_channel_reprs_from_state(state_old, layer_keys=match_keys, device=device)
+    reprs_new = extract_channel_reprs_from_state(state_new, layer_keys=match_keys, device=device)
+
     layer_permutations = {}
     for key in match_keys:
-        Eo, Eo_edges = reprs_old.get(key, None), edge_reprs_old.get(key, None)
-        En, En_edges = reprs_new.get(key, None), edge_reprs_new.get(key, None)
+        Eo = reprs_old.get(key, None)
+        En = reprs_new.get(key, None)
         if Eo is None or En is None:
             continue
-        C = compute_cost_matrix(Eo, En, Eo_edges, En_edges)
-        # Layer-specific strategy
-        is_deep = 'layer3' in key or 'layer4' in key  # Giả định layer deep
-        if is_deep:
-            C = -C  # Minimize similarity for deep layers
-        perm = adaptive_match_from_cost(C, tau=0.5)
+        C = compute_cost_matrix(Eo, En)  # (n_old, n_new)
+        perm = greedy_match_from_cost(C)  # numpy array length n_old -> new_idx or -1
         layer_permutations[key] = perm
-    k = float(args.get("ensemble_step", 0.6))
+
+    k = float(args.get("ensemble_step", 0.6)) if isinstance(args, dict) else float(getattr(args, 'ensemble_step', 0.6))
     fused_state = apply_permutation_and_fuse_state(state_old, state_new, layer_permutations, k=k, device=device)
     return fused_state
 
@@ -405,21 +418,8 @@ class LwI(BaseLearner):
                 optimizer = optim.SGD(self._network.parameters(), lr=lrate, momentum=0.9, weight_decay=weight_decay)
                 scheduler = optim.lr_scheduler.MultiStepLR(optimizer=optimizer, milestones=milestones, gamma=lrate_decay)
                 self._update_representation(train_loader, test_loader, optimizer, scheduler)
-            self._build_protos()
-            if hasattr(self, '_old_network') and self._old_network is not None:
-                try:
-                    teacher_old = deepcopy(self._old_network).to(self._device)
-                    teacher_old.eval()
-                    fused_state = perform_lwi_fusion(self._old_network, self._network, self.args, device=self._device)
-                    fused_state_device = {k: v.to(self._device) for k, v in fused_state.items()}
-                    self._network.load_state_dict(fused_state_device, strict=False)
-                    # Cập nhật mô hình cũ
-                    self._old_network.load_state_dict(fused_state_device, strict=False)
-                    logging.info("LwI fusion applied: updated both model_new and model_old.")
-                except Exception as e:
-                    logging.exception("LwI fusion failed, falling back to original model. Error: {}".format(e))
-            else:
-                teacher_old = None      
+            self._build_protos()                
+                    
                     
             if self.args["DPCR"]:
                 print('Using DPCR')
@@ -438,6 +438,7 @@ class LwI(BaseLearner):
                     for i, (_, inputs, targets) in enumerate(train_loader):
                         inputs, targets = inputs.to(self._device), targets.to(self._device)
                         feats_old = self._old_network(inputs)["features"]
+                        # print(feats_old)
                         feats_new = self._network(inputs)["features"]
                         cov_pwdr += torch.t(feats_old) @ feats_old
                         cov_new += torch.t(feats_new) @ feats_new
