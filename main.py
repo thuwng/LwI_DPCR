@@ -1,5 +1,6 @@
 import json
 import argparse
+import torch
 from trainer import train
 
 def main():
