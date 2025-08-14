@@ -79,33 +79,15 @@ class LwI(BaseLearner):
         self.E = args.get("E", 1000)
         self.num_per_class = args.get("num_per_class", 500)  # Giá trị mặc định
         if self.args["dataset"] == "imagenet100" or self.args["dataset"] == "imagenet1000":
-            epochs = 100
-            lrate = 0.05
-            milestones = [45, 90]
-            lrate_decay = 0.1
-            batch_size = 128
-            weight_decay = 2e-4
-            num_workers = 8
-            T = 2
-            lamda = 5
             self.num_per_class = 1300
         elif self.args["dataset"] == "tinyimagenet200":
-            epochs = 100
-            lrate = 0.001
-            milestones = [45, 90]
-            lrate_decay = 0.1
-            batch_size = 128
-            weight_decay = 2e-4
-            num_workers = 8
-            T = 2
-            lamda = 10
             self.num_per_class = 500
-        print("Number of samples per class:{}".format(self.num_per_class))
-        if self.args["dataset"] == "cub200":
+        elif self.args["dataset"] == "cub200":
             init_lr = 0.1
             lrate = 0.05
             lamda = 20
             self.num_per_class = 30
+        print("Number of samples per class:{}".format(self.num_per_class))
         if self.args["cosine"]:
             self._network = CosineIncrementalNet(args, False)
         else:
@@ -164,10 +146,10 @@ class LwI(BaseLearner):
             P[row_ind, col_ind] = 1
         else:  
             n, m = R.shape
-            a = torch.ones(n, device=self._device) / n 
-            b = torch.ones(m, device=self._device) / m  
+            a = torch.ones(n, device=self._device, dtype=torch.float32) / n 
+            b = torch.ones(m, device=self._device, dtype=torch.float32) / m  
 
-            M = -R if layer == 3 else R  
+            M = (-R if layer == 3 else R).to(dtype=torch.float32)  
 
             P = self.sinkhorn_torch(
                 M=M,
@@ -186,12 +168,17 @@ class LwI(BaseLearner):
         return P    
 
     def sinkhorn_torch(self, M, a, b, lambda_sh, numItermax=5000, stopThr=.5e-2, cuda=False):
+        # Đảm bảo tất cả tensor có dtype float32
+        M = M.to(dtype=torch.float32)
+        a = a.to(dtype=torch.float32)
+        b = b.to(dtype=torch.float32)
+
         if cuda:
-            u = (torch.ones_like(a) / a.size()[0]).double().cuda()
-            v = (torch.ones_like(b)).double().cuda()
+            u = (torch.ones_like(a) / a.size()[0]).to(self._device)
+            v = (torch.ones_like(b) / b.size()[0]).to(self._device)
         else:
             u = (torch.ones_like(a) / a.size()[0])
-            v = (torch.ones_like(b))
+            v = (torch.ones_like(b) / b.size()[0])
 
         K = torch.exp(-M * lambda_sh)
         err = 1
@@ -242,8 +229,8 @@ class LwI(BaseLearner):
         else:
             self._network.update_fc(self._total_classes)
 
-        if self.al_classifier == None:
-            self.al_classifier = ALClassifier(512, self._total_classes, 0, self._device,args=self.args).to(self._device)
+        if self.al_classifier is None:
+            self.al_classifier = ALClassifier(512, self._total_classes, 0, self._device, args=self.args).to(self._device)
             for name, param in self.al_classifier.named_parameters():
                 param.requires_grad = False
         else:
@@ -259,7 +246,6 @@ class LwI(BaseLearner):
             mode="train",
             shot=self.shot
         )
-        # self.train_dataset = train_dataset
         self.train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
         )
@@ -277,7 +263,7 @@ class LwI(BaseLearner):
             self._network = self._network.module
 
     def _train(self, train_loader, test_loader):
-        resume = self.args['resume']  # set resume=True to use saved checkpoints
+        resume = self.args['resume']
         if self._cur_task == 0:
             if resume:
                 checkpoint_path = "{}{}_model.pth.tar".format(self.args["model_dir"], self._total_classes)
@@ -306,7 +292,7 @@ class LwI(BaseLearner):
                     out_fe, pred = self.al_classifier(out_backbone)
                     label_onehot = F.one_hot(targets, self._total_classes).float()
                     cov += torch.t(out_fe) @ out_fe
-                    crs_cor += torch.t(out_fe) @ (label_onehot)
+                    crs_cor += torch.t(out_fe) @ label_onehot
             self.al_classifier.cov = self.al_classifier.cov + cov
             self.al_classifier.R = self.al_classifier.R + cov
             self.al_classifier.Q = self.al_classifier.Q + crs_cor
@@ -317,7 +303,6 @@ class LwI(BaseLearner):
                     F.normalize(torch.t(Delta.float()), p=2, dim=-1))
             self._build_protos()
         else:
-            resume = self.args['resume']
             if resume:
                 checkpoint_path = "{}{}_model.pth.tar".format(self.args["model_dir"], self._total_classes)
                 if not os.path.exists(checkpoint_path):
@@ -335,13 +320,12 @@ class LwI(BaseLearner):
                 self._update_representation(train_loader, test_loader, optimizer, scheduler)
             self._build_protos()                
                     
-                    
             if self.args["DPCR"]:
                 print('Using DPCR')
                 if self.al_classifier is None:
                     raise ValueError("ALClassifier is not initialized!")
                 self._network.eval()
-                self.projector = Drift_Estimator(512,False,self.args)
+                self.projector = Drift_Estimator(512, False, self.args)
                 self.projector.to(self._device)
                 for name, param in self.projector.named_parameters():
                     param.requires_grad = False
@@ -355,13 +339,12 @@ class LwI(BaseLearner):
                     for i, (_, inputs, targets) in enumerate(train_loader):
                         inputs, targets = inputs.to(self._device), targets.to(self._device)
                         feats_old = self._old_network(inputs)["features"]
-                        # print(feats_old)
                         feats_new = self._network(inputs)["features"]
                         cov_pwdr += torch.t(feats_old) @ feats_old
                         cov_new += torch.t(feats_new) @ feats_new
-                        crs_cor_pwdr += torch.t(feats_old) @ (feats_new)
+                        crs_cor_pwdr += torch.t(feats_old) @ feats_new
                         label_onehot = F.one_hot(targets, self._total_classes).float()
-                        crs_cor_new += torch.t(feats_new) @ (label_onehot)
+                        crs_cor_new += torch.t(feats_new) @ label_onehot
                 self.projector.cov = cov_pwdr
                 self.projector.Q = crs_cor_pwdr
                 R_inv = torch.inverse(cov_pwdr.cpu()).to(self._device)
@@ -394,17 +377,11 @@ class LwI(BaseLearner):
                 self.al_classifier.fc.weight = torch.nn.parameter.Parameter(
                         F.normalize(torch.t(Delta.float()), p=2, dim=-1))
 
-
-
-
-
-    # SVD for calculating the W_c
     def get_projector_svd(self, raw_matrix, all_non_zeros=True):
         V, S, VT = torch.svd(raw_matrix)
         if all_non_zeros:
             non_zeros_idx = torch.where(S > 0)[0]
             left_eign_vectors = V[:, non_zeros_idx]
-
         else:
             left_eign_vectors = V[:, :512]
         projector = left_eign_vectors @ torch.t(left_eign_vectors)
@@ -418,12 +395,11 @@ class LwI(BaseLearner):
                                                                            mode='test', shot=self.shot, ret_data=True)
                 idx_loader = DataLoader(idx_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
                 vectors, _ = self._extract_vectors(idx_loader)
-                class_mean = np.mean(vectors, axis=0)  # vectors.mean(0)
-                cov = np.dot(np.transpose(vectors),vectors)
-                self._protos.append(torch.tensor(class_mean).to(self._device))
-                self._covs.append(torch.tensor(cov).to(self._device))
+                class_mean = np.mean(vectors, axis=0)
+                cov = np.dot(np.transpose(vectors), vectors)
+                self._protos.append(torch.tensor(class_mean, dtype=torch.float32).to(self._device))
+                self._covs.append(torch.tensor(cov, dtype=torch.float32).to(self._device))
                 self._projectors.append(self.get_projector_svd(self._covs[class_idx]))
-
 
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
         prog_bar = tqdm(range(init_epoch))
@@ -471,7 +447,6 @@ class LwI(BaseLearner):
         logging.info(info)
 
     def _update_representation(self, train_loader, test_loader, optimizer, scheduler):
-
         prog_bar = tqdm(range(epochs))
         for _, epoch in enumerate(prog_bar):
             self._network.train()
@@ -483,18 +458,17 @@ class LwI(BaseLearner):
 
                 fake_targets = targets - self._known_classes
                 loss_clf = F.cross_entropy(
-                    logits[:, self._known_classes :], fake_targets
+                    logits[:, self._known_classes:], fake_targets
                 )
                 
-                loss_kd = torch.tensor(0.0, device=self._device)
-                loss_ot = torch.tensor(0.0, device=self._device)
+                loss_kd = torch.tensor(0.0, device=self._device, dtype=torch.float32)
+                loss_ot = torch.tensor(0.0, device=self._device, dtype=torch.float32)
                 if self._old_network is not None:
                     loss_kd = _KD_loss(
-                        logits[:, : self._known_classes],
+                        logits[:, :self._known_classes],
                         self._old_network(inputs)["logits"],
                         T,
                     )
-
                     aligned_layers, _ = get_wassersteinized_layers_modularized(self.args, self._device,
                                                                              [self._old_network, self._network])
                     for old_layer, new_layer in zip(self._old_network.parameters(), aligned_layers):
