@@ -18,7 +18,7 @@ import ot
 from models.our_groundmetric import GroundMetric
 
 
-init_epoch = 200
+init_epoch = 2 #test
 init_lr = 0.1
 init_milestones = [60, 120, 160]
 init_lr_decay = 0.1
