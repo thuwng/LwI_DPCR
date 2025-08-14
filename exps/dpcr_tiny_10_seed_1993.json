@@ -1,0 +1,20 @@
+{
+    "prefix": "dpcr_tiny_10_seed_1993",
+    "dataset": "tinyimagenet200",
+    "memory_size": 0,
+    "fixed_memory": false,
+    "shuffle": true,
+    "cosine": true,
+    "init_cls": 20,
+    "increment": 20,
+    "model_name": "lwf",
+    "convnet_type": "resnet18",
+    "batch_size" : 64,
+    "device": ["0"],
+    "seed": [1993],
+    "resume": true,
+    "model_dir": "save_model/tiny-imagenet/resnet18/dpcr_tiny_10_seed_1993/",
+    "DPCR": true,
+    "rg": 2000,
+    "rg_gdc": 1e-9
+}

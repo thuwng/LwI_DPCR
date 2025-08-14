@@ -1,0 +1,20 @@
+{
+    "prefix": "dpcr_I100_10_seed_1993",
+    "dataset": "imagenet100",
+    "memory_size": 0,
+    "fixed_memory": false,
+    "shuffle": true,
+    "cosine": true,
+    "init_cls": 10,
+    "increment": 10,
+    "model_name": "lwf",
+    "convnet_type": "resnet18",
+    "batch_size" : 128,
+    "device": ["1"],
+    "seed": [1993],
+    "resume": false,
+    "model_dir": "save_model/imagenet-100/resnet18/re_ldc_I100_10_seed_1993/",
+    "DPCR": true,
+    "rg": 2000,
+    "rg_tssp": 1e-9
+}
