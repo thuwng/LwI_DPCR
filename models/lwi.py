@@ -28,7 +28,8 @@ milestones = [45, 90]
 lrate_decay = 0.1
 batch_size = 128
 weight_decay = 2e-4
-num_workers = 8
+# GIẢM workers để tránh tiêu tốn RAM ở Kaggle
+num_workers = 2
 T = 2
 lamda = 10
 k = 0.5  # fuse blend
@@ -44,10 +45,7 @@ def _KD_loss(pred, soft, T):
 
 class LwI(BaseLearner):
     """
-    Phiên bản đã vá đầy đủ để train được (Kaggle/colab).
-    - Hợp nhất trọng số theo hàng (out_features/out_channels).
-    - Phunghop P với W_old an toàn hình dạng cho conv/linear.
-    - Dùng dict cho protos/covs/projectors, tránh out-of-range.
+    Bản đã vá để tránh OOM và fix shape mismatch khi fuse weight.
     """
 
     def __init__(self, args):
@@ -67,7 +65,6 @@ class LwI(BaseLearner):
         elif ds == "tinyimagenet200":
             self.num_per_class = 500
         elif ds == "cub200":
-            # chú ý: các biến toàn cục ở đầu file là hằng; sửa ở đây nếu cần
             self.num_per_class = 30
 
         print(f"Number of samples per class:{self.num_per_class}")
@@ -111,10 +108,9 @@ class LwI(BaseLearner):
         """
         Align & fuse theo chiều out_features/out_channels:
         - Flatten weight thành (n_out, -1)
-        - Tính R similarity giữa hàng W_old và W_new
-        - Sinh P (Hungarian/Sinkhorn) kích thước (n_out_old, n_out_new)
-        - Với n_out_old == n_out_new, P là ma trận hoán vị vuông -> P@W_old_2d
-        - Reshape lại về shape cũ.
+        - Tính R similarity theo batch (CPU by default để tránh OOM)
+        - Sinh P (Hungarian/Sinkhorn)
+        - Nhân và reshape lại
         """
         if self._old_network is None or self._network is None:
             return
@@ -126,9 +122,9 @@ class LwI(BaseLearner):
             if W_old is None or W_new is None:
                 continue
 
-            # ép float32 + về device
-            W_old = W_old.to(self._device, dtype=torch.float32)
-            W_new = W_new.to(self._device, dtype=torch.float32)
+            # ép float32 (để đồng nhất)
+            W_old = W_old.to(dtype=torch.float32)
+            W_new = W_new.to(dtype=torch.float32)
 
             # flatten thành (n_out, -1) theo out-dim
             W_old_2d, shape_old = self._flatten_out_first(W_old)
@@ -144,26 +140,31 @@ class LwI(BaseLearner):
                 )
                 continue
 
-            # similarity giữa hàng (kênh out)
-            R = self._compute_similarity(W_old_2d, W_new_2d)  # (n_out_old, n_out_new)
+            # similarity giữa hàng (kênh out).
+            # DÙNG CPU & batch để tránh OOM. Trả về tensor trên CPU.
+            R = self._compute_similarity(W_old_2d, W_new_2d, batch_size=4096, use_cpu=True)
 
-            # P có kích thước (n_out_new, n_out_old) nếu ta muốn P@W_old_2d -> (n_out_new, feat)
-            # nhưng ta có thể xây P dạng (n_out_new, n_out_old) bằng cách giải assignment theo max R^T
+            # P trả về (n_old, n_new)
             P = self._compute_permutation_matrix(R, layer)  # mặc định trả về (n_out_old, n_out_new)
-            # chuyển về (n_out_new, n_out_old) để nhân trái
-            P_left = P.t().contiguous()
+
+            # chuyển về (n_out_new, n_out_old) để nhân trái (P_left @ W_old_2d)
+            P_left = P.t().contiguous().to(dtype=torch.float32)
 
             if P_left.shape != (n_out_new, n_out_old):
                 raise ValueError(f"P_left shape invalid: {P_left.shape}, expected {(n_out_new, n_out_old)}")
 
-            aligned_old = torch.matmul(P_left, W_old_2d)  # (n_out_new, feat)
+            # đảm bảo W_old_2d, W_new_2d cùng device trước khi nhân -> đặt về CPU/GPU tùy P_left
+            # P_left có thể đang ở GPU nếu sinkhorn dùng GPU; nhưng ở trường hợp use_cpu=True ở trên, P đang trên CPU.
+            device_for_matmul = P_left.device
+            aligned_old = torch.matmul(P_left.to(device_for_matmul), W_old_2d.to(device_for_matmul))  # (n_out_new, feat)
 
             if layer == 2:
                 W_fused_2d = aligned_old
             else:
-                W_fused_2d = k * aligned_old + (1 - k) * W_new_2d
+                W_fused_2d = k * aligned_old + (1 - k) * W_new_2d.to(device_for_matmul)
 
-            W_fused = W_fused_2d.view(*shape_new)
+            # reshape về shape_new (đảm bảo cùng device)
+            W_fused = W_fused_2d.view(*shape_new).to(self._device)
             self._old_network.set_layer_weights(layer, W_fused)
 
     def _flatten_out_first(self, W):
@@ -172,13 +173,16 @@ class LwI(BaseLearner):
         - Linear: (out_features, in_features) -> (out_features, in_features)
         - Conv: (out_channels, in_channels, kH, kW) -> (out_channels, in_channels*kH*kW)
         - BatchNorm/others 1D: (num_features,) -> (num_features, 1)
+        Trả về (W_2d, original_shape)
         """
         if W.dim() == 2:
             shape = W.shape
             return W, shape
         elif W.dim() >= 3:
             n_out = W.shape[0]
-            return W.view(n_out, -1), (n_out, *W.shape[1:])
+            # Lưu shape ban đầu để reshape lại: (n_out, c, h, w, ...)
+            orig_shape = (n_out, *W.shape[1:])
+            return W.view(n_out, -1), orig_shape
         elif W.dim() == 1:
             n_out = W.shape[0]
             return W.view(n_out, 1), (n_out,)
@@ -186,60 +190,77 @@ class LwI(BaseLearner):
             raise ValueError(f"Unsupported weight dim: {W.shape}")
 
     def _compute_similarity(self, W_old, W_new, batch_size=4096, use_cpu=True):
+        """
+        Tính cosine similarity giữa các hàng của W_old và W_new theo batch.
+        Trả về ma trận R kích thước (n_out_old, n_out_new).
+        Mặc định chạy trên CPU để tránh OOM; có thể đặt use_cpu=False để chạy trên GPU (chỉ cho layer nhỏ).
+        """
+        # đảm bảo dạng 2D và float
+        W_old_2d = W_old.view(W_old.size(0), -1).float()
+        W_new_2d = W_new.view(W_new.size(0), -1).float()
+
         if use_cpu:
-            W_old = W_old.cpu()
-            W_new = W_new.cpu()
-        W_old_norm = F.normalize(W_old, p=2, dim=1)
-        W_new_norm = F.normalize(W_new, p=2, dim=1)
+            device_calc = torch.device("cpu")
+        else:
+            device_calc = self._device
+
+        W_old_norm = F.normalize(W_old_2d.to(device_calc), p=2, dim=1)
+        W_new_norm = F.normalize(W_new_2d.to(device_calc), p=2, dim=1)
 
         n_old = W_old_norm.size(0)
-        sims = []
+        sims_parts = []
+        # Tính theo batch trên chiều n_old
         for start in range(0, n_old, batch_size):
             end = min(start + batch_size, n_old)
-            sims.append(torch.matmul(W_old_norm[start:end], W_new_norm.t()))
-        sims = torch.cat(sims, dim=0)
-        return sims.to(W_old.device if not use_cpu else "cpu")
+            part = torch.matmul(W_old_norm[start:end], W_new_norm.t())
+            sims_parts.append(part.cpu())  # giữ tạm trên CPU để giảm áp lực RAM/GPU
+
+        R = torch.cat(sims_parts, dim=0)  # trên CPU
+        return R  # R ở CPU
 
     def _compute_permutation_matrix(self, R, layer):
         """
-        Với layer==3 có thể muốn 'đảo dấu' tiêu chí (như code gốc),
-        còn lại tối đa hóa R.
-        Trả về P kích thước (n_out_old, n_out_new) với hàng sum=1 (Hungarian -> one-hot).
-        Với Sinkhorn: a,b đều uniform, P xấp xỉ doubly-stochastic.
+        Trả về P kích thước (n_old, n_new) (hàng là old, cột là new).
+        Với tau < 0.1 -> Hungarian (one-hot rows)
+        Ngược lại -> Sinkhorn (doubly-stochastic approx)
         """
         if R.numel() == 0 or R.dim() != 2:
             raise ValueError(f"Input R invalid: {R.shape}")
 
-        # chọn max hay min theo layer
-        cost = -R if layer == 3 else -R  # ta đều maximize similarity -> minimize -R
+        # tối đa hoá similarity => minimize -R
+        cost = -R
 
-        n_old, n_new = R.shape  # (n_out_old, n_out_new)
+        n_old, n_new = R.shape
 
         if self.tau < 0.1:
-            # Hungarian cho ma trận chữ nhật -> trả về matching tối đa
+            # Hungarian (chi phí trên CPU numpy)
             row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
-            P = torch.zeros((n_old, n_new), device=self._device, dtype=torch.float32)
+            P = torch.zeros((n_old, n_new), device=torch.device("cpu"), dtype=torch.float32)
             P[row_ind, col_ind] = 1.0
             return P
         else:
-            # Sinkhorn ổn định số
-            a = torch.full((n_old,), 1.0 / n_old, device=self._device, dtype=torch.float32)
-            b = torch.full((n_new,), 1.0 / n_new, device=self._device, dtype=torch.float32)
-            M = (-R if layer == 3 else -R).to(dtype=torch.float32)  # maximize R => minimize -R
+            # Sinkhorn: chúng ta sẽ thực hiện triển khai trên device self._device
+            a = torch.full((n_old,), 1.0 / n_old, dtype=torch.float32, device=self._device)
+            b = torch.full((n_new,), 1.0 / n_new, dtype=torch.float32, device=self._device)
+            M = (-R).to(dtype=torch.float32)  # R có thể đang ở CPU
+            # gọi sinkhorn; trong sinkhorn sẽ move M -> self._device
             P = self.sinkhorn_torch(M=M, a=a, b=b, lambda_sh=1.0, numItermax=self.E, stopThr=1e-4,
                                     cuda=(self._device.type == 'cuda'))
-            return P
+            return P.cpu() if P.device != torch.device("cpu") else P
 
     def sinkhorn_torch(self, M, a, b, lambda_sh, numItermax=5000, stopThr=5e-3, cuda=False):
         """
         Trả về P ~ argmin <P,M> s.t. P1=a, P^T1=b, P>=0
         K = exp(-lambda*M); cập nhật u,v; cuối cùng P = diag(u) K diag(v) = outer(u,v)*K
+        Lưu ý: M có thể là CPU tensor; ta convert về device self._device để tính (nhưng P có thể to lớn)
         """
-        M = M.to(dtype=torch.float32, device=self._device)
-        a = a.to(dtype=torch.float32, device=self._device)
-        b = b.to(dtype=torch.float32, device=self._device)
+        device = self._device if cuda else torch.device("cpu")
+        M = M.to(dtype=torch.float32, device=device)
+        a = a.to(dtype=torch.float32, device=device)
+        b = b.to(dtype=torch.float32, device=device)
 
-        K = torch.exp(-lambda_sh * M).clamp_min(1e-12)  # tránh underflow
+        # tránh overflow/underflow
+        K = torch.exp(-lambda_sh * M).clamp_min(1e-12)
         u = torch.ones_like(a) / a.size(0)
         v = torch.ones_like(b) / b.size(0)
 
@@ -254,7 +275,6 @@ class LwI(BaseLearner):
             v = b / KTu
 
             if it % 20 == 0:
-                # kiểm tra sai số theo marginal b
                 b_est = v * (K.t() @ u)
                 err = torch.norm(b_est - b, p=float('inf')).item()
                 if err < stopThr:
@@ -467,7 +487,6 @@ class LwI(BaseLearner):
         if all_non_zeros:
             non_zeros_idx = torch.where(S > 1e-12)[0]
             if non_zeros_idx.numel() == 0:
-                # fallback: lấy tất cả
                 left_vectors = V
             else:
                 left_vectors = V[:, non_zeros_idx]
@@ -489,7 +508,8 @@ class LwI(BaseLearner):
                 shot=self.shot,
                 ret_data=True
             )
-            idx_loader = DataLoader(idx_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+            # giảm num_workers để tránh RAM spike
+            idx_loader = DataLoader(idx_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
             vectors, _ = self._extract_vectors(idx_loader)  # numpy [N, fe]
             class_mean = np.mean(vectors, axis=0)  # [fe]
             cov = np.dot(vectors.T, vectors)  # [fe, fe]
@@ -505,7 +525,6 @@ class LwI(BaseLearner):
                     proto_t = proto_t[:, :fe]
                     cov_t = cov_t[:fe, :fe]
                 else:
-                    # pad zeros
                     pad = fe - proto_t.shape[1]
                     proto_t = F.pad(proto_t, (0, pad))
                     cov_pad = torch.zeros((fe, fe), device=self._device)
@@ -572,12 +591,10 @@ class LwI(BaseLearner):
                     try:
                         aligned_layers, _ = get_wassersteinized_layers_modularized(self.args, self._device,
                                                                                    [self._old_network, self._network])
-                        # bảo vệ shape
                         for old_param, new_like in zip(self._old_network.parameters(), aligned_layers):
                             if old_param.shape == new_like.shape:
                                 loss_ot += F.mse_loss(old_param, new_like)
                     except Exception as e:
-                        # Không có hàm hoặc lỗi khác -> bỏ qua loss_ot để không crash
                         logging.warning(f"[OT] skipped due to: {e}")
 
                 loss = lamda * loss_kd + loss_clf + 0.1 * loss_ot
