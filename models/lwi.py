@@ -16,6 +16,8 @@ from torchvision import datasets, transforms
 from utils.autoaugment import CIFAR10Policy
 import ot 
 from models.our_groundmetric import GroundMetric
+from scipy.optimize import linear_sum_assignment
+import math
 
 
 init_epoch = 2 #test
@@ -35,8 +37,6 @@ num_workers = 8
 T = 2
 lamda = 10
 k = 0.5
-tau = 0.1
-E = 1000
 
 # Tiny-ImageNet200
 # epochs = 100
@@ -74,6 +74,10 @@ class LwI(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
         self.args = args
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.tau = args.get("tau", 0.1)
+        self.E = args.get("E", 1000)
+        self.num_per_class = args.get("num_per_class", 500)  # Giá trị mặc định
         if self.args["dataset"] == "imagenet100" or self.args["dataset"] == "imagenet1000":
             epochs = 100
             lrate = 0.05
@@ -95,6 +99,7 @@ class LwI(BaseLearner):
             num_workers = 8
             T = 2
             lamda = 10
+            self.num_per_class = 500
         print("Number of samples per class:{}".format(self.num_per_class))
         if self.args["dataset"] == "cub200":
             init_lr = 0.1
@@ -109,7 +114,9 @@ class LwI(BaseLearner):
         self._network.split_layers()  
         self._old_network = None
         self._protos = []
-        self.al_classifier = None
+        self.al_classifier = ALClassifier(512, 0, 0, self._device, args=self.args).to(self._device)
+        for name, param in self.al_classifier.named_parameters():
+            param.requires_grad = False
         if self.args["DPCR"]:
             self._covs = []
             self._projectors = []
@@ -149,16 +156,58 @@ class LwI(BaseLearner):
         return torch.matmul(W_old_norm, W_new_norm.t())
 
     def _compute_permutation_matrix(self, R, layer):
-        if tau < 0.1: 
+        if R.shape[0] == 0 or R.shape[1] == 0:
+            raise ValueError("Input matrix R has invalid dimensions: {}".format(R.shape))
+        if self.tau < 0.1: 
             row_ind, col_ind = linear_sum_assignment(-R.cpu().numpy() if layer == 3 else R.cpu().numpy())
             P = torch.zeros(R.shape, device=self._device)
             P[row_ind, col_ind] = 1
         else:  
-            P = sinkhorn(R.cpu().numpy(), reg=1.0, maxiters=E)
-            P = torch.tensor(P, device=self._device)
-        if layer == 3:  
-            P = -P
+            n, m = R.shape
+            a = torch.ones(n, device=self._device) / n 
+            b = torch.ones(m, device=self._device) / m  
+
+            M = -R if layer == 3 else R  
+
+            P = self.sinkhorn_torch(
+                M=M,
+                a=a,
+                b=b,
+                lambda_sh=1.0,  
+                numItermax=self.E,   
+                stopThr=1e-4,  
+                cuda=(self._device.type == 'cuda')
+            )
+
+            P = P.to(self._device)
+            if not math.isclose(torch.sum(P).item(), 1.0, abs_tol=1e-7):
+                logging.warning(f"Sum of transport map is {torch.sum(P).item()}, expected ~1.0")
+
         return P    
+
+    def sinkhorn_torch(self, M, a, b, lambda_sh, numItermax=5000, stopThr=.5e-2, cuda=False):
+        if cuda:
+            u = (torch.ones_like(a) / a.size()[0]).double().cuda()
+            v = (torch.ones_like(b)).double().cuda()
+        else:
+            u = (torch.ones_like(a) / a.size()[0])
+            v = (torch.ones_like(b))
+
+        K = torch.exp(-M * lambda_sh)
+        err = 1
+        cpt = 0
+        while err > stopThr and cpt < numItermax:
+            u = torch.div(a, torch.matmul(K, torch.div(b, torch.matmul(u.t(), K).t())))
+            cpt += 1
+            if cpt % 20 == 1:
+                v = torch.div(b, torch.matmul(K.t(), u))
+                u = torch.div(a, torch.matmul(K, v))
+                bb = torch.mul(v, torch.matmul(K.t(), u))
+                err = torch.norm(torch.sum(torch.abs(bb - b), dim=0), p=float('inf'))
+
+        # Tính ma trận vận chuyển P = diag(u) * K * diag(v)
+        P = torch.diag(u) @ K @ torch.diag(v)
+        return P
 
     def incremental_train(self, data_manager):
         self.data_manager = data_manager
@@ -231,8 +280,11 @@ class LwI(BaseLearner):
         resume = self.args['resume']  # set resume=True to use saved checkpoints
         if self._cur_task == 0:
             if resume:
-                print("Loading checkpoint: {}{}_model.pth.tar".format(self.args["model_dir"], self._total_classes))
-                self._network.load_state_dict(torch.load("{}{}_model.pth.tar".format(self.args["model_dir"], self._total_classes))["state_dict"], strict=False)
+                checkpoint_path = "{}{}_model.pth.tar".format(self.args["model_dir"], self._total_classes)
+                if not os.path.exists(checkpoint_path):
+                    raise FileNotFoundError(f"Checkpoint file {checkpoint_path} not found!")
+                print(f"Loading checkpoint: {checkpoint_path}")
+                self._network.load_state_dict(torch.load(checkpoint_path)["state_dict"], strict=False)
             self._network.to(self._device)
             if hasattr(self._network, "module"):
                 self._network_module_ptr = self._network.module
@@ -267,8 +319,11 @@ class LwI(BaseLearner):
         else:
             resume = self.args['resume']
             if resume:
-                print("Loading checkpoint: {}{}_model.pth.tar".format(self.args["model_dir"], self._total_classes))
-                self._network.load_state_dict(torch.load("{}{}_model.pth.tar".format(self.args["model_dir"], self._total_classes))["state_dict"], strict=False)
+                checkpoint_path = "{}{}_model.pth.tar".format(self.args["model_dir"], self._total_classes)
+                if not os.path.exists(checkpoint_path):
+                    raise FileNotFoundError(f"Checkpoint file {checkpoint_path} not found!")
+                print(f"Loading checkpoint: {checkpoint_path}")
+                self._network.load_state_dict(torch.load(checkpoint_path)["state_dict"], strict=False)
             self._network.to(self._device)
             if hasattr(self._network, "module"):
                 self._network_module_ptr = self._network.module
@@ -283,6 +338,8 @@ class LwI(BaseLearner):
                     
             if self.args["DPCR"]:
                 print('Using DPCR')
+                if self.al_classifier is None:
+                    raise ValueError("ALClassifier is not initialized!")
                 self._network.eval()
                 self.projector = Drift_Estimator(512,False,self.args)
                 self.projector.to(self._device)
@@ -331,7 +388,7 @@ class LwI(BaseLearner):
                 R_prime = cov_prime + self.al_classifier.gamma * torch.eye(self.al_classifier.fe_size).to(self._device)
                 self.al_classifier.cov = cov_prime + cov_new
                 self.al_classifier.Q = Q_prime + crs_cor_new
-                self.al_classifier.R = R_prime+ cov_new
+                self.al_classifier.R = R_prime + cov_new
                 R_inv = torch.inverse(self.al_classifier.R.cpu()).to(self._device)
                 Delta = R_inv @ self.al_classifier.Q
                 self.al_classifier.fc.weight = torch.nn.parameter.Parameter(
@@ -428,17 +485,22 @@ class LwI(BaseLearner):
                 loss_clf = F.cross_entropy(
                     logits[:, self._known_classes :], fake_targets
                 )
-                loss_kd = _KD_loss(
-                    logits[:, : self._known_classes],
-                    self._old_network(inputs)["logits"],
-                    T,
-                )
+                
+                loss_kd = torch.tensor(0.0, device=self._device)
+                loss_ot = torch.tensor(0.0, device=self._device)
+                if self._old_network is not None:
+                    loss_kd = _KD_loss(
+                        logits[:, : self._known_classes],
+                        self._old_network(inputs)["logits"],
+                        T,
+                    )
 
-                aligned_layers, _ = get_wassersteinized_layers_modularized(self.args, self._device,
-                                                                         [self._old_network, self._network])
-                loss_ot = torch.tensor(0.0, device=self._device)  
-                for old_layer, new_layer in zip(self._old_network.parameters(), aligned_layers):
-                    loss_ot += F.mse_loss(old_layer, new_layer)
+                    aligned_layers, _ = get_wassersteinized_layers_modularized(self.args, self._device,
+                                                                             [self._old_network, self._network])
+                    for old_layer, new_layer in zip(self._old_network.parameters(), aligned_layers):
+                        if old_layer.shape != new_layer.shape:
+                            raise ValueError(f"Shape mismatch in loss_ot: {old_layer.shape} vs {new_layer.shape}")
+                        loss_ot += F.mse_loss(old_layer, new_layer)
 
                 loss = lamda * loss_kd + loss_clf + 0.1 * loss_ot
 
