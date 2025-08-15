@@ -144,8 +144,97 @@ class LwI(BaseLearner):
 
     # ---------------- weight fusion ----------------
     @torch.no_grad()
+    def _compute_similarity(self, W_old, W_new, batch_size=512, use_cpu=True):
+        import numpy as _np
+        import os
+        import psutil
+
+        # Đảm bảo ma trận trên CPU và contiguous
+        W_old_2d = W_old.view(W_old.size(0), -1).float().cpu().contiguous()
+        W_new_2d = W_new.view(W_new.size(0), -1).float().cpu().contiguous()
+        
+        # Ghi log thông tin layer
+        layer_debug = getattr(self, "_last_fuse_layer", None)
+        if layer_debug is not None:
+            self._log_layer_info(layer_debug, W_old_2d, W_new_2d)
+        
+        # Chuẩn hóa ma trận
+        W_old_norm = F.normalize(W_old_2d, p=2, dim=1)
+        W_new_norm = F.normalize(W_new_2d, p=2, dim=1)
+        
+        n_old, n_new = W_old_norm.size(0), W_new_norm.size(0)
+        if self.debug_mode:
+            # Log kích thước ma trận và ước tính kích thước memmap
+            matrix_size_bytes = n_old * n_new * 4  # float32 = 4 bytes
+            matrix_size_gb = matrix_size_bytes / (1024 ** 3)
+            logging.info(f"[Similarity] n_old={n_old}, n_new={n_new}, R_shape={(n_old, n_new)}, "
+                        f"Estimated R size: {matrix_size_gb:.2f} GB")
+            
+            # Log dung lượng đĩa trống
+            disk_usage = psutil.disk_usage('/kaggle/working')
+            logging.info(f"[Disk] Free space in /kaggle/working: {disk_usage.free / (1024 ** 3):.2f} GB, "
+                        f"Total: {disk_usage.total / (1024 ** 3):.2f} GB")
+        
+        # Nếu ma trận nhỏ, tính trực tiếp trong RAM để tránh I/O
+        if min(n_old, n_new) < 10:
+            logging.info("[Similarity] Small matrix detected, computing directly in RAM")
+            R = W_old_norm @ W_new_norm.t()
+            if self.debug_mode:
+                logging.info(f"[Similarity] Computed R in RAM, shape={R.shape}, "
+                            f"memory usage: {psutil.virtual_memory().used / (1024 ** 3):.2f} GB")
+            return R.cpu().numpy()
+        
+        # Sử dụng /kaggle/working thay vì /tmp
+        tmpdir = "/kaggle/working"
+        if not os.path.exists(tmpdir):
+            os.makedirs(tmpdir)
+        fname = os.path.join(tmpdir, f"similarity_R_{os.getpid()}_{int(torch.randint(0, int(1e9), (1,)).item())}.dat")
+        
+        try:
+            # Log trước khi tạo memmap
+            if self.debug_mode:
+                logging.info(f"[Similarity] Creating memmap file: {fname}")
+            
+            # Tạo memmap
+            R_memmap = _np.memmap(fname, dtype='float32', mode='w+', shape=(n_old, n_new))
+            
+            # Log sau khi tạo memmap
+            if self.debug_mode and os.path.exists(fname):
+                file_size = os.path.getsize(fname) / (1024 ** 3)
+                logging.info(f"[Similarity] Memmap file created: {fname}, size={file_size:.2f} GB")
+            
+            # Tính similarity theo batch
+            W_new_np = W_new_norm.numpy()
+            for start in range(0, n_old, batch_size):
+                end = min(start + batch_size, n_old)
+                if self.debug_mode:
+                    logging.info(f"[Similarity] Processing batch {start}:{end} of {n_old}")
+                block_old = W_old_norm[start:end].numpy()
+                block_sim = block_old.dot(W_new_np.T)
+                R_memmap[start:end, :] = block_sim.astype('float32')
+                R_memmap.flush()
+                if self.debug_mode:
+                    logging.info(f"[Similarity] Batch {start}:{end} written to memmap, "
+                                f"RAM usage: {psutil.virtual_memory().used / (1024 ** 3):.2f} GB")
+                del block_old, block_sim
+            
+            return R_memmap
+        
+        except Exception as e:
+            logging.error(f"[Similarity] Error in _compute_similarity: {e}")
+            logging.error(f"[Similarity] Traceback: {traceback.format_exc()}")
+            raise
+        finally:
+            # Dọn dẹp bộ nhớ
+            del W_old_norm, W_new_norm, W_new_np
+            safe_cuda_empty()
+            if self.debug_mode:
+                logging.info(f"[Similarity] Cleaned up temporary tensors, "
+                            f"RAM usage: {psutil.virtual_memory().used / (1024 ** 3):.2f} GB")
+
     def _fuse_weights(self):
         if self._old_network is None or self._network is None:
+            logging.info("[Fuse] Skipping _fuse_weights: old_network or network is None")
             return
         
         HUNGARIAN_MAX = self.args.get("hungarian_max", 3000)
@@ -155,6 +244,7 @@ class LwI(BaseLearner):
             W_new = self._network.get_layer_weights(layer)
             
             if W_old is None or W_new is None:
+                logging.warning(f"[Fuse] Skipping layer {layer}: W_old or W_new is None")
                 continue
             
             # Chuyển ma trận sang CPU
@@ -168,32 +258,37 @@ class LwI(BaseLearner):
             n_out_new, feat_new = W_new_2d.shape
             
             if feat_old != feat_new:
-                logging.warning(f"[Fuse] skip layer {layer}: feature dim mismatch old({feat_old}) vs new({feat_new})")
+                logging.warning(f"[Fuse] Skip layer {layer}: feature dim mismatch old({feat_old}) vs new({feat_new})")
                 continue
             
             if self.debug_mode:
                 print_mem(f"fuse_weights layer {layer} - before similarity")
+                logging.info(f"[Fuse] Layer {layer} shapes: W_old_2d={W_old_2d.shape}, W_new_2d={W_new_2d.shape}")
             
             self._last_fuse_layer = layer
             R = None
             try:
                 # Tính ma trận tương tự
+                logging.info(f"[Fuse] Starting similarity computation for layer {layer}")
                 R = self._compute_similarity(W_old_2d, W_new_2d, batch_size=512, use_cpu=True)
                 
                 # Chọn phương pháp tính permutation matrix
                 if hasattr(R, 'shape') and min(R.shape) <= HUNGARIAN_MAX and self.tau < 0.1:
+                    logging.info(f"[Fuse] Using Hungarian algorithm for layer {layer}")
                     P = self._compute_permutation_matrix(R, layer)
                 else:
                     if self.debug_mode:
-                        logging.warning(f"[Fuse] layer {layer} large ({R.shape}), using greedy approx matching")
+                        logging.warning(f"[Fuse] Layer {layer} large ({R.shape}), using greedy approx matching")
                     P = self._approx_permutation_from_memmap(R, layer)
                 
                 P_left = P.t().contiguous().to(dtype=torch.float32, device=self._cpu)
                 
                 if P_left.shape != (n_out_new, n_out_old):
+                    logging.error(f"[Fuse] P_left shape invalid: {P_left.shape}, expected {(n_out_new, n_out_old)}")
                     raise ValueError(f"P_left shape invalid: {P_left.shape}, expected {(n_out_new, n_out_old)}")
                 
                 # Tính fused weights
+                logging.info(f"[Fuse] Computing fused weights for layer {layer}")
                 aligned_old = torch.matmul(P_left, W_old_2d)
                 if layer == 2:
                     W_fused_2d = aligned_old
@@ -202,22 +297,33 @@ class LwI(BaseLearner):
                 
                 W_fused = W_fused_2d.view(*shape_new).to(self._cpu)
                 self._old_network.set_layer_weights(layer, W_fused)
+                if self.debug_mode:
+                    logging.info(f"[Fuse] Layer {layer} weights fused and set, "
+                                f"RAM usage: {psutil.virtual_memory().used / (1024 ** 3):.2f} GB")
             
             finally:
                 # Dọn dẹp tệp memmap
                 if R is not None and hasattr(R, 'filename') and os.path.exists(R.filename):
                     try:
+                        file_size = os.path.getsize(R.filename) / (1024 ** 3)
+                        logging.info(f"[Fuse] Removing memmap file: {R.filename}, size={file_size:.2f} GB")
                         os.remove(R.filename)
                     except Exception as e:
-                        logging.warning(f"Failed to remove memmap file {R.filename}: {e}")
+                        logging.warning(f"[Fuse] Failed to remove memmap file {R.filename}: {e}")
                 del R
                 safe_cuda_empty()
+                if self.debug_mode:
+                    logging.info(f"[Fuse] Cleaned up after layer {layer}, "
+                                f"RAM usage: {psutil.virtual_memory().used / (1024 ** 3):.2f} GB")
             
             if self.debug_mode:
                 print_mem(f"fuse_weights layer {layer} - after processing")
         
         if self.debug_mode:
             print_mem("after _fuse_weights")
+            disk_usage = psutil.disk_usage('/kaggle/working')
+            logging.info(f"[Fuse] Final disk usage: Free={disk_usage.free / (1024 ** 3):.2f} GB, "
+                        f"Total={disk_usage.total / (1024 ** 3):.2f} GB")
 
     def _flatten_out_first(self, W):
         if W.dim() == 2:
@@ -238,62 +344,6 @@ class LwI(BaseLearner):
             print(f"[LAYER INFO] layer={layer} W_old_2d.shape={tuple(W_old_2d.shape)} W_new_2d.shape={tuple(W_new_2d.shape)}")
         except Exception:
             pass
-
-    def _compute_similarity(self, W_old, W_new, batch_size=512, use_cpu=True):
-        import numpy as _np
-        import os
-        
-        # Đảm bảo ma trận trên CPU và contiguous
-        W_old_2d = W_old.view(W_old.size(0), -1).float().cpu().contiguous()
-        W_new_2d = W_new.view(W_new.size(0), -1).float().cpu().contiguous()
-        
-        # Ghi log thông tin layer
-        layer_debug = getattr(self, "_last_fuse_layer", None)
-        if layer_debug is not None:
-            self._log_layer_info(layer_debug, W_old_2d, W_new_2d)
-        
-        # Chuẩn hóa ma trận
-        W_old_norm = F.normalize(W_old_2d, p=2, dim=1)
-        W_new_norm = F.normalize(W_new_2d, p=2, dim=1)
-        
-        n_old, n_new = W_old_norm.size(0), W_new_norm.size(0)
-        if self.debug_mode:
-            print(f"[Similarity] n_old={n_old}, n_new={n_new}, R_shape={(n_old, n_new)}")
-        
-        # Nếu ma trận nhỏ, tính trực tiếp trong RAM để tránh I/O
-        if min(n_old, n_new) < 10:
-            R = W_old_norm @ W_new_norm.t()
-            return R.cpu().numpy()  # Trả về numpy array
-        
-        # Sử dụng /kaggle/working thay vì /tmp
-        tmpdir = "/kaggle/working"
-        if not os.path.exists(tmpdir):
-            os.makedirs(tmpdir)
-        fname = os.path.join(tmpdir, f"similarity_R_{os.getpid()}_{int(torch.randint(0, int(1e9), (1,)).item())}.dat")
-        
-        try:
-            # Tạo memmap để lưu ma trận R
-            R_memmap = _np.memmap(fname, dtype='float32', mode='w+', shape=(n_old, n_new))
-            
-            # Tính similarity theo batch
-            W_new_np = W_new_norm.numpy()
-            for start in range(0, n_old, batch_size):
-                end = min(start + batch_size, n_old)
-                block_old = W_old_norm[start:end].numpy()
-                block_sim = block_old.dot(W_new_np.T)
-                R_memmap[start:end, :] = block_sim.astype('float32')
-                R_memmap.flush()
-                del block_old, block_sim
-            
-            return R_memmap
-        
-        except Exception as e:
-            logging.error(f"Error in _compute_similarity: {e}")
-            raise
-        finally:
-            # Dọn dẹp bộ nhớ
-            del W_old_norm, W_new_norm, W_new_np
-            safe_cuda_empty()
 
     def _approx_permutation_from_memmap(self, R, layer):
         """Approximate a one-to-one matching from similarity memmap R (n_old x n_new).
