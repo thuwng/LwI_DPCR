@@ -172,6 +172,7 @@ class LwI(BaseLearner):
             if self.debug_mode:
                 print_mem(f"fuse_weights layer {layer} - before similarity")
 
+            self._last_fuse_layer = layer
             R = self._compute_similarity(W_old_2d, W_new_2d, batch_size=1024, use_cpu=True)
             P = self._compute_permutation_matrix(R, layer)
             P_left = P.t().contiguous().to(dtype=torch.float32, device=self._cpu)
@@ -212,41 +213,102 @@ class LwI(BaseLearner):
         else:
             raise ValueError(f"Unsupported weight dim: {W.shape}")
 
-    def _compute_similarity(self, W_old, W_new, batch_size=1024, use_cpu=True):
-        # Force CPU computation
-        W_old_2d = W_old.view(W_old.size(0), -1).float().to(self._cpu)
-        W_new_2d = W_new.view(W_new.size(0), -1).float().to(self._cpu)
+    def _log_layer_info(self, layer, W_old_2d, W_new_2d):
+        try:
+            print(f"[LAYER INFO] layer={layer} W_old_2d.shape={tuple(W_old_2d.shape)} W_new_2d.shape={tuple(W_new_2d.shape)}")
+        except Exception:
+            pass
 
+    def _compute_similarity(self, W_old, W_new, batch_size=1024, use_cpu=True):
+    
+        import numpy as _np
+        import tempfile, os
+
+        # ensure CPU & contiguous
+        W_old_2d = W_old.view(W_old.size(0), -1).float().cpu().contiguous()
+        W_new_2d = W_new.view(W_new.size(0), -1).float().cpu().contiguous()
+
+        # logging shape
+        try:
+            layer_debug = getattr(self, "_last_fuse_layer", None)
+            if layer_debug is not None:
+                self._log_layer_info(layer_debug, W_old_2d, W_new_2d)
+        except Exception:
+            pass
+
+        # normalize rows (on CPU)
         W_old_norm = F.normalize(W_old_2d, p=2, dim=1)
         W_new_norm = F.normalize(W_new_2d, p=2, dim=1)
 
         n_old = W_old_norm.size(0)
-        sims_parts = []
+        n_new = W_new_norm.size(0)
+
+        # create memmap file (temporary) for R with dtype float32
+        tmpdir = tempfile.gettempdir()
+        fname = os.path.join(tmpdir, f"similarity_R_{os.getpid()}_{int(torch.randint(0,1e9,(1,)).item())}.dat")
+        # allocate memmap on disk (shape n_old x n_new)
+        R_memmap = _np.memmap(fname, dtype='float32', mode='w+', shape=(n_old, n_new))
+
+        # compute in blocks: iterate over rows of W_old (batch_size) and fill memmap
+        # convert W_new_norm to numpy once (fits memory if feat small); else block both dims.
+        W_new_np = W_new_norm.numpy()  # shape (n_new, feat)
         for start in range(0, n_old, batch_size):
             end = min(start + batch_size, n_old)
-            part = torch.matmul(W_old_norm[start:end], W_new_norm.t())
-            sims_parts.append(part)
-            del part
-        R = torch.cat(sims_parts, dim=0)
-        del sims_parts, W_old_norm, W_new_norm
-        return R  # CPU tensor
+            # slice old block -> numpy
+            block_old = W_old_norm[start:end].numpy()  # shape (block, feat)
+            # compute block similarity (block x n_new) via matmul (numpy)
+            # note: block_old @ W_new_np.T  => (block, n_new)
+            block_sim = block_old.dot(W_new_np.T)
+            # write into memmap
+            R_memmap[start:end, :] = block_sim.astype('float32')
+            # flush to disk to release page cache
+            R_memmap.flush()
+            # cleanup temporaries
+            del block_old, block_sim
+        # cleanup normalized tensors to free RAM
+        del W_old_norm, W_new_norm, W_new_np
+        safe_cuda_empty()
+
+        # return numpy memmap (ndarray-like, on-disk-backed)
+        return R_memmap
 
     def _compute_permutation_matrix(self, R, layer):
-        if R.numel() == 0 or R.dim() != 2:
-            raise ValueError(f"Input R invalid: {R.shape}")
+        """
+        Trả về P kích thước (n_old, n_new).
+        R có thể là torch tensor (CPU) hoăc numpy.ndarray (memmap).
+        Với tau < 0.1 -> Hungarian; ngược lại -> Sinkhorn (sử dụng CPU).
+        """
+        import numpy as _np
 
-        cost = -R
-        n_old, n_new = R.shape
+        # convert shape extraction
+        if isinstance(R, _np.memmap) or isinstance(R, _np.ndarray):
+            n_old, n_new = R.shape
+        elif torch.is_tensor(R):
+            n_old, n_new = R.shape
+            R = R.cpu().numpy()
+        else:
+            raise ValueError(f"Unsupported R type: {type(R)}")
+
+        if n_old == 0 or n_new == 0:
+            raise ValueError(f"Input R invalid: {(n_old, n_new)}")
 
         if self.tau < 0.1:
-            row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
-            P = torch.zeros((n_old, n_new), device=self._cpu, dtype=torch.float32)
+            # Hungarian expects a dense numpy array in memory, but memmap is OK (it provides ndarray interface)
+            cost = -R  # numpy memmap or ndarray
+            row_ind, col_ind = linear_sum_assignment(cost)
+            P = torch.zeros((n_old, n_new), device=torch.device("cpu"), dtype=torch.float32)
             P[row_ind, col_ind] = 1.0
             return P
         else:
-            a = torch.full((n_old,), 1.0 / n_old, dtype=torch.float32, device=self._cpu)
-            b = torch.full((n_new,), 1.0 / n_new, dtype=torch.float32, device=self._cpu)
-            M = (-R).to(dtype=torch.float32, device=self._cpu)
+            # use numpy -> convert to torch CPU as before for sinkhorn implementation
+            if isinstance(R, _np.ndarray):
+                R_torch = torch.from_numpy(R.astype('float32')).to(torch.device("cpu"))
+            else:
+                # fallback: if R is torch already
+                R_torch = R if torch.is_tensor(R) else torch.from_numpy(_np.array(R)).to(torch.device("cpu"))
+            a = torch.full((n_old,), 1.0 / n_old, dtype=torch.float32, device=torch.device("cpu"))
+            b = torch.full((n_new,), 1.0 / n_new, dtype=torch.float32, device=torch.device("cpu"))
+            M = (-R_torch).to(dtype=torch.float32)
             P = self.sinkhorn_torch(M=M, a=a, b=b, lambda_sh=1.0, numItermax=1000, stopThr=1e-4, cuda=False)
             return P
 
