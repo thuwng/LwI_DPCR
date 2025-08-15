@@ -44,17 +44,20 @@ def print_mem(tag=""):
     else:
         print(f"[MEM] {tag} (no CUDA)")
 
+
 def safe_cuda_empty():
     try:
         torch.cuda.empty_cache()
     except Exception:
         pass
 
+
 def _KD_loss(pred, soft, T):
     # both pred and soft must be on same device
     pred = torch.log_softmax(pred / T, dim=1)
     soft = torch.softmax(soft / T, dim=1)
     return -1 * torch.mul(soft, pred).sum() / pred.shape[0]
+
 
 # ---------------- main class ----------------
 class LwI(BaseLearner):
@@ -144,9 +147,16 @@ class LwI(BaseLearner):
     def _fuse_weights(self):
         """
         Compute similarity and fuse weights entirely on CPU to avoid VRAM spikes.
+        Improvements included to avoid running Hungarian on enormous matrices:
+        - if matching size too large, use greedy top-match assignment (approximate)
+        - remove memmap file after use
+        - safety checks and logging
         """
         if self._old_network is None or self._network is None:
             return
+
+        # threshold to decide when Hungarian is too expensive
+        HUNGARIAN_MAX = self.args.get("hungarian_max", 3000)
 
         for layer in range(2, 5):
             W_old = self._old_network.get_layer_weights(layer)
@@ -174,27 +184,47 @@ class LwI(BaseLearner):
 
             self._last_fuse_layer = layer
             R = self._compute_similarity(W_old_2d, W_new_2d, batch_size=1024, use_cpu=True)
-            P = self._compute_permutation_matrix(R, layer)
-            P_left = P.t().contiguous().to(dtype=torch.float32, device=self._cpu)
 
-            if P_left.shape != (n_out_new, n_out_old):
-                raise ValueError(f"P_left shape invalid: {P_left.shape}, expected {(n_out_new, n_out_old)}")
+            try:
+                # if matrix small enough -> do Hungarian (exact)
+                if hasattr(R, 'shape') and min(R.shape) <= HUNGARIAN_MAX and self.tau < 0.1:
+                    P = self._compute_permutation_matrix(R, layer)
+                else:
+                    # too large for Hungarian: use approximate greedy matching
+                    if self.debug_mode:
+                        logging.warning(f"[Fuse] layer {layer} large ({R.shape}), using greedy approx matching")
+                    P = self._approx_permutation_from_memmap(R, layer)
 
-            # aligned_old on CPU
-            aligned_old = torch.matmul(P_left, W_old_2d)  # CPU matmul
+                P_left = P.t().contiguous().to(dtype=torch.float32, device=self._cpu)
 
-            if layer == 2:
-                W_fused_2d = aligned_old
-            else:
-                W_fused_2d = k * aligned_old + (1 - k) * W_new_2d
+                if P_left.shape != (n_out_new, n_out_old):
+                    raise ValueError(f"P_left shape invalid: {P_left.shape}, expected {(n_out_new, n_out_old)}")
 
-            # IMPORTANT: keep fused weights on CPU and set them into old_network on CPU
-            W_fused = W_fused_2d.view(*shape_new).to(self._cpu)
-            self._old_network.set_layer_weights(layer, W_fused)
+                # aligned_old on CPU
+                aligned_old = torch.matmul(P_left, W_old_2d)  # CPU matmul
 
-            # free intermediate CPU tensors
-            del R, P, P_left, W_old_2d, W_new_2d, aligned_old, W_fused_2d, W_fused
-            safe_cuda_empty()
+                if layer == 2:
+                    W_fused_2d = aligned_old
+                else:
+                    W_fused_2d = k * aligned_old + (1 - k) * W_new_2d
+
+                # IMPORTANT: keep fused weights on CPU and set them into old_network on CPU
+                W_fused = W_fused_2d.view(*shape_new).to(self._cpu)
+                self._old_network.set_layer_weights(layer, W_fused)
+
+            finally:
+                # cleanup intermediate CPU tensors and remove memmap file if present
+                try:
+                    if hasattr(R, 'filename') and os.path.exists(R.filename):
+                        try:
+                            os.remove(R.filename)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                del R
+                safe_cuda_empty()
 
         if self.debug_mode:
             print_mem("after _fuse_weights")
@@ -220,7 +250,7 @@ class LwI(BaseLearner):
             pass
 
     def _compute_similarity(self, W_old, W_new, batch_size=1024, use_cpu=True):
-    
+
         import numpy as _np
         import tempfile, os
 
@@ -272,11 +302,75 @@ class LwI(BaseLearner):
         # return numpy memmap (ndarray-like, on-disk-backed)
         return R_memmap
 
+    def _approx_permutation_from_memmap(self, R, layer):
+        """Approximate a one-to-one matching from similarity memmap R (n_old x n_new).
+        Strategy:
+        - find best candidate old index for each new column by scanning R in blocks (memory-friendly)
+        - sort candidate pairs by similarity and greedily assign unique old indices
+        - build a sparse permutation matrix P (n_old x n_new) with 1 where assigned
+        This is O(n_old * n_new) in I/O but avoids the O(n^3) Hungarian and huge RAM use.
+        """
+        import numpy as _np
+
+        n_old, n_new = R.shape
+        # best value & index per new column
+        best_vals = -1e9 * _np.ones((n_new,), dtype='float32')
+        best_idxs = -1 * _np.ones((n_new,), dtype='int64')
+
+        # scan rows in blocks to find argmax per column
+        BLOCK = 1024
+        for start in range(0, n_old, BLOCK):
+            end = min(start + BLOCK, n_old)
+            block = R[start:end, :]  # memmap supports this without loading full file
+            # block shape: (block_size, n_new)
+            # compute max along rows for each column
+            block_max = block.max(axis=0)
+            block_arg = block.argmax(axis=0)
+
+            # update global bests
+            mask = block_max > best_vals
+            if mask.any():
+                best_vals[mask] = block_max[mask]
+                best_idxs[mask] = (start + block_arg[mask])
+
+        # form candidate list (val, new_idx, old_idx)
+        candidates = []
+        for new_idx in range(n_new):
+            old_idx = int(best_idxs[new_idx])
+            val = float(best_vals[new_idx])
+            if old_idx >= 0:
+                candidates.append((val, new_idx, old_idx))
+
+        # sort by descending similarity
+        candidates.sort(reverse=True, key=lambda x: x[0])
+
+        assigned_old = set()
+        assigned_new = set()
+        pairs = []
+        for val, new_idx, old_idx in candidates:
+            if old_idx in assigned_old:
+                continue
+            if new_idx in assigned_new:
+                continue
+            assigned_old.add(old_idx)
+            assigned_new.add(new_idx)
+            pairs.append((old_idx, new_idx))
+            if len(assigned_old) >= min(n_old, n_new):
+                break
+
+        # build sparse P
+        P = torch.zeros((n_old, n_new), device=self._cpu, dtype=torch.float32)
+        for old_idx, new_idx in pairs:
+            if 0 <= old_idx < n_old and 0 <= new_idx < n_new:
+                P[old_idx, new_idx] = 1.0
+
+        return P
+
     def _compute_permutation_matrix(self, R, layer):
         """
         Trả về P kích thước (n_old, n_new).
         R có thể là torch tensor (CPU) hoăc numpy.ndarray (memmap).
-        Với tau < 0.1 -> Hungarian; ngược lại -> Sinkhorn (sử dụng CPU).
+        Với tau < 0.1 -> Hungarian (khi kích thước chấp nhận được); ngược lại -> Sinkhorn (sử dụng CPU).
         """
         import numpy as _np
 
@@ -292,17 +386,26 @@ class LwI(BaseLearner):
         if n_old == 0 or n_new == 0:
             raise ValueError(f"Input R invalid: {(n_old, n_new)}")
 
-        if self.tau < 0.1:
+        # safety cap for Hungarian: if too large, raise to let caller decide
+        HUNGARIAN_MAX = self.args.get("hungarian_max", 3000)
+        if self.tau < 0.1 and min(n_old, n_new) <= HUNGARIAN_MAX:
             # Hungarian expects a dense numpy array in memory, but memmap is OK (it provides ndarray interface)
             cost = -R  # numpy memmap or ndarray
             row_ind, col_ind = linear_sum_assignment(cost)
             P = torch.zeros((n_old, n_new), device=torch.device("cpu"), dtype=torch.float32)
             P[row_ind, col_ind] = 1.0
             return P
+
+        if self.tau < 0.1 and min(n_old, n_new) > HUNGARIAN_MAX:
+            # caller should have used approx; fallback to approx here
+            if self.debug_mode:
+                logging.warning(f"[Fuse] Hungarian too large for layer {layer} ({n_old}x{n_new}), falling back to approx")
+            return self._approx_permutation_from_memmap(R, layer)
+
         else:
             # use numpy -> convert to torch CPU as before for sinkhorn implementation
-            if isinstance(R, _np.ndarray):
-                R_torch = torch.from_numpy(R.astype('float32')).to(torch.device("cpu"))
+            if isinstance(R, _np.ndarray) or isinstance(R, _np.memmap):
+                R_torch = torch.from_numpy(_np.array(R, dtype='float32')).to(torch.device("cpu"))
             else:
                 # fallback: if R is torch already
                 R_torch = R if torch.is_tensor(R) else torch.from_numpy(_np.array(R)).to(torch.device("cpu"))
