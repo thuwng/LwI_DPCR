@@ -9,7 +9,7 @@
     "increment": 10,
     "model_name": "lwi",
     "convnet_type": "resnet18",
-    "batch_size": 32,
+    "batch_size": 16,
     "device": ["0"],
     "seed": [1993],
     "resume": false,
