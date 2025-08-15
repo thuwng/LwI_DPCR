@@ -245,7 +245,7 @@ class LwI(BaseLearner):
 
         # create memmap file (temporary) for R with dtype float32
         tmpdir = tempfile.gettempdir()
-        fname = os.path.join(tmpdir, f"similarity_R_{os.getpid()}_{int(torch.randint(0,1e9,(1,)).item())}.dat")
+        fname = os.path.join(tmpdir, f"similarity_R_{os.getpid()}_{int(torch.randint(0, int(1e9), (1,)).item())}.dat")
         # allocate memmap on disk (shape n_old x n_new)
         R_memmap = _np.memmap(fname, dtype='float32', mode='w+', shape=(n_old, n_new))
 
