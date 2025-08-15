@@ -145,87 +145,77 @@ class LwI(BaseLearner):
     # ---------------- weight fusion ----------------
     @torch.no_grad()
     def _fuse_weights(self):
-        """
-        Compute similarity and fuse weights entirely on CPU to avoid VRAM spikes.
-        Improvements included to avoid running Hungarian on enormous matrices:
-        - if matching size too large, use greedy top-match assignment (approximate)
-        - remove memmap file after use
-        - safety checks and logging
-        """
         if self._old_network is None or self._network is None:
             return
-
-        # threshold to decide when Hungarian is too expensive
+        
         HUNGARIAN_MAX = self.args.get("hungarian_max", 3000)
-
+        
         for layer in range(2, 5):
             W_old = self._old_network.get_layer_weights(layer)
             W_new = self._network.get_layer_weights(layer)
-
+            
             if W_old is None or W_new is None:
                 continue
-
-            # ensure CPU float32 -> avoid any GPU copy
+            
+            # Chuyển ma trận sang CPU
             W_old = W_old.detach().float().to(self._cpu)
             W_new = W_new.detach().float().to(self._cpu)
-
+            
             W_old_2d, shape_old = self._flatten_out_first(W_old)
             W_new_2d, shape_new = self._flatten_out_first(W_new)
-
+            
             n_out_old, feat_old = W_old_2d.shape
             n_out_new, feat_new = W_new_2d.shape
-
+            
             if feat_old != feat_new:
                 logging.warning(f"[Fuse] skip layer {layer}: feature dim mismatch old({feat_old}) vs new({feat_new})")
                 continue
-
+            
             if self.debug_mode:
                 print_mem(f"fuse_weights layer {layer} - before similarity")
-
+            
             self._last_fuse_layer = layer
-            R = self._compute_similarity(W_old_2d, W_new_2d, batch_size=1024, use_cpu=True)
-
+            R = None
             try:
-                # if matrix small enough -> do Hungarian (exact)
+                # Tính ma trận tương tự
+                R = self._compute_similarity(W_old_2d, W_new_2d, batch_size=512, use_cpu=True)
+                
+                # Chọn phương pháp tính permutation matrix
                 if hasattr(R, 'shape') and min(R.shape) <= HUNGARIAN_MAX and self.tau < 0.1:
                     P = self._compute_permutation_matrix(R, layer)
                 else:
-                    # too large for Hungarian: use approximate greedy matching
                     if self.debug_mode:
                         logging.warning(f"[Fuse] layer {layer} large ({R.shape}), using greedy approx matching")
                     P = self._approx_permutation_from_memmap(R, layer)
-
+                
                 P_left = P.t().contiguous().to(dtype=torch.float32, device=self._cpu)
-
+                
                 if P_left.shape != (n_out_new, n_out_old):
                     raise ValueError(f"P_left shape invalid: {P_left.shape}, expected {(n_out_new, n_out_old)}")
-
-                # aligned_old on CPU
-                aligned_old = torch.matmul(P_left, W_old_2d)  # CPU matmul
-
+                
+                # Tính fused weights
+                aligned_old = torch.matmul(P_left, W_old_2d)
                 if layer == 2:
                     W_fused_2d = aligned_old
                 else:
                     W_fused_2d = k * aligned_old + (1 - k) * W_new_2d
-
-                # IMPORTANT: keep fused weights on CPU and set them into old_network on CPU
+                
                 W_fused = W_fused_2d.view(*shape_new).to(self._cpu)
                 self._old_network.set_layer_weights(layer, W_fused)
-
+            
             finally:
-                # cleanup intermediate CPU tensors and remove memmap file if present
-                try:
-                    if hasattr(R, 'filename') and os.path.exists(R.filename):
-                        try:
-                            os.remove(R.filename)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
+                # Dọn dẹp tệp memmap
+                if R is not None and hasattr(R, 'filename') and os.path.exists(R.filename):
+                    try:
+                        os.remove(R.filename)
+                    except Exception as e:
+                        logging.warning(f"Failed to remove memmap file {R.filename}: {e}")
                 del R
                 safe_cuda_empty()
-
+            
+            if self.debug_mode:
+                print_mem(f"fuse_weights layer {layer} - after processing")
+        
         if self.debug_mode:
             print_mem("after _fuse_weights")
 
@@ -249,58 +239,61 @@ class LwI(BaseLearner):
         except Exception:
             pass
 
-    def _compute_similarity(self, W_old, W_new, batch_size=1024, use_cpu=True):
-
+    def _compute_similarity(self, W_old, W_new, batch_size=512, use_cpu=True):
         import numpy as _np
-        import tempfile, os
-
-        # ensure CPU & contiguous
+        import os
+        
+        # Đảm bảo ma trận trên CPU và contiguous
         W_old_2d = W_old.view(W_old.size(0), -1).float().cpu().contiguous()
         W_new_2d = W_new.view(W_new.size(0), -1).float().cpu().contiguous()
-
-        # logging shape
-        try:
-            layer_debug = getattr(self, "_last_fuse_layer", None)
-            if layer_debug is not None:
-                self._log_layer_info(layer_debug, W_old_2d, W_new_2d)
-        except Exception:
-            pass
-
-        # normalize rows (on CPU)
+        
+        # Ghi log thông tin layer
+        layer_debug = getattr(self, "_last_fuse_layer", None)
+        if layer_debug is not None:
+            self._log_layer_info(layer_debug, W_old_2d, W_new_2d)
+        
+        # Chuẩn hóa ma trận
         W_old_norm = F.normalize(W_old_2d, p=2, dim=1)
         W_new_norm = F.normalize(W_new_2d, p=2, dim=1)
-
-        n_old = W_old_norm.size(0)
-        n_new = W_new_norm.size(0)
-
-        # create memmap file (temporary) for R with dtype float32
-        tmpdir = tempfile.gettempdir()
+        
+        n_old, n_new = W_old_norm.size(0), W_new_norm.size(0)
+        if self.debug_mode:
+            print(f"[Similarity] n_old={n_old}, n_new={n_new}, R_shape={(n_old, n_new)}")
+        
+        # Nếu ma trận nhỏ, tính trực tiếp trong RAM để tránh I/O
+        if min(n_old, n_new) < 10:
+            R = W_old_norm @ W_new_norm.t()
+            return R.cpu().numpy()  # Trả về numpy array
+        
+        # Sử dụng /kaggle/working thay vì /tmp
+        tmpdir = "/kaggle/working"
+        if not os.path.exists(tmpdir):
+            os.makedirs(tmpdir)
         fname = os.path.join(tmpdir, f"similarity_R_{os.getpid()}_{int(torch.randint(0, int(1e9), (1,)).item())}.dat")
-        # allocate memmap on disk (shape n_old x n_new)
-        R_memmap = _np.memmap(fname, dtype='float32', mode='w+', shape=(n_old, n_new))
-
-        # compute in blocks: iterate over rows of W_old (batch_size) and fill memmap
-        # convert W_new_norm to numpy once (fits memory if feat small); else block both dims.
-        W_new_np = W_new_norm.numpy()  # shape (n_new, feat)
-        for start in range(0, n_old, batch_size):
-            end = min(start + batch_size, n_old)
-            # slice old block -> numpy
-            block_old = W_old_norm[start:end].numpy()  # shape (block, feat)
-            # compute block similarity (block x n_new) via matmul (numpy)
-            # note: block_old @ W_new_np.T  => (block, n_new)
-            block_sim = block_old.dot(W_new_np.T)
-            # write into memmap
-            R_memmap[start:end, :] = block_sim.astype('float32')
-            # flush to disk to release page cache
-            R_memmap.flush()
-            # cleanup temporaries
-            del block_old, block_sim
-        # cleanup normalized tensors to free RAM
-        del W_old_norm, W_new_norm, W_new_np
-        safe_cuda_empty()
-
-        # return numpy memmap (ndarray-like, on-disk-backed)
-        return R_memmap
+        
+        try:
+            # Tạo memmap để lưu ma trận R
+            R_memmap = _np.memmap(fname, dtype='float32', mode='w+', shape=(n_old, n_new))
+            
+            # Tính similarity theo batch
+            W_new_np = W_new_norm.numpy()
+            for start in range(0, n_old, batch_size):
+                end = min(start + batch_size, n_old)
+                block_old = W_old_norm[start:end].numpy()
+                block_sim = block_old.dot(W_new_np.T)
+                R_memmap[start:end, :] = block_sim.astype('float32')
+                R_memmap.flush()
+                del block_old, block_sim
+            
+            return R_memmap
+        
+        except Exception as e:
+            logging.error(f"Error in _compute_similarity: {e}")
+            raise
+        finally:
+            # Dọn dẹp bộ nhớ
+            del W_old_norm, W_new_norm, W_new_np
+            safe_cuda_empty()
 
     def _approx_permutation_from_memmap(self, R, layer):
         """Approximate a one-to-one matching from similarity memmap R (n_old x n_new).
