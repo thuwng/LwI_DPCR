@@ -26,10 +26,9 @@ epochs = 100
 lrate = 0.05
 milestones = [45, 90]
 lrate_decay = 0.1
-batch_size = 128
+batch_size = 64  # Giảm từ 128 để giảm RAM
 weight_decay = 2e-4
-# GIẢM workers để tránh tiêu tốn RAM ở Kaggle
-num_workers = 2
+num_workers = 0  # Tắt workers để giảm RAM
 T = 2
 lamda = 10
 k = 0.5  # fuse blend
@@ -106,11 +105,7 @@ class LwI(BaseLearner):
     @torch.no_grad()
     def _fuse_weights(self):
         """
-        Align & fuse theo chiều out_features/out_channels:
-        - Flatten weight thành (n_out, -1)
-        - Tính R similarity theo batch (CPU by default để tránh OOM)
-        - Sinh P (Hungarian/Sinkhorn)
-        - Nhân và reshape lại
+        Align & fuse theo chiều out_features/out_channels.
         """
         if self._old_network is None or self._network is None:
             return
@@ -122,11 +117,9 @@ class LwI(BaseLearner):
             if W_old is None or W_new is None:
                 continue
 
-            # ép float32 (để đồng nhất)
             W_old = W_old.to(dtype=torch.float32)
             W_new = W_new.to(dtype=torch.float32)
 
-            # flatten thành (n_out, -1) theo out-dim
             W_old_2d, shape_old = self._flatten_out_first(W_old)
             W_new_2d, shape_new = self._flatten_out_first(W_new)
 
@@ -134,38 +127,32 @@ class LwI(BaseLearner):
             n_out_new, feat_new = W_new_2d.shape
 
             if feat_old != feat_new:
-                # Với conv có thể khác kích thước nếu kiến trúc thay đổi -> bỏ qua fuse layer này
                 logging.warning(
                     f"[Fuse] skip layer {layer}: feature dim mismatch old({feat_old}) vs new({feat_new})"
                 )
                 continue
 
-            # similarity giữa hàng (kênh out).
-            # DÙNG CPU & batch để tránh OOM. Trả về tensor trên CPU.
-            R = self._compute_similarity(W_old_2d, W_new_2d, batch_size=4096, use_cpu=True)
-
-            # P trả về (n_old, n_new)
-            P = self._compute_permutation_matrix(R, layer)  # mặc định trả về (n_out_old, n_out_new)
-
-            # chuyển về (n_out_new, n_out_old) để nhân trái (P_left @ W_old_2d)
+            R = self._compute_similarity(W_old_2d, W_new_2d, batch_size=1024, use_cpu=True)
+            P = self._compute_permutation_matrix(R, layer)
             P_left = P.t().contiguous().to(dtype=torch.float32)
 
             if P_left.shape != (n_out_new, n_out_old):
                 raise ValueError(f"P_left shape invalid: {P_left.shape}, expected {(n_out_new, n_out_old)}")
 
-            # đảm bảo W_old_2d, W_new_2d cùng device trước khi nhân -> đặt về CPU/GPU tùy P_left
-            # P_left có thể đang ở GPU nếu sinkhorn dùng GPU; nhưng ở trường hợp use_cpu=True ở trên, P đang trên CPU.
-            device_for_matmul = P_left.device
-            aligned_old = torch.matmul(P_left.to(device_for_matmul), W_old_2d.to(device_for_matmul))  # (n_out_new, feat)
+            device_for_matmul = torch.device("cpu")  # Chuyển matmul sang CPU
+            aligned_old = torch.matmul(P_left.to(device_for_matmul), W_old_2d.to(device_for_matmul))
 
             if layer == 2:
                 W_fused_2d = aligned_old
             else:
                 W_fused_2d = k * aligned_old + (1 - k) * W_new_2d.to(device_for_matmul)
 
-            # reshape về shape_new (đảm bảo cùng device)
             W_fused = W_fused_2d.view(*shape_new).to(self._device)
             self._old_network.set_layer_weights(layer, W_fused)
+
+            # Giải phóng bộ nhớ
+            del R, P, P_left, W_old_2d, W_new_2d, aligned_old, W_fused_2d
+            torch.cuda.empty_cache()
 
     def _flatten_out_first(self, W):
         """
@@ -189,98 +176,86 @@ class LwI(BaseLearner):
         else:
             raise ValueError(f"Unsupported weight dim: {W.shape}")
 
-    def _compute_similarity(self, W_old, W_new, batch_size=4096, use_cpu=True):
+    def _compute_similarity(self, W_old, W_new, batch_size=1024, use_cpu=True):
         """
         Tính cosine similarity giữa các hàng của W_old và W_new theo batch.
         Trả về ma trận R kích thước (n_out_old, n_out_new).
-        Mặc định chạy trên CPU để tránh OOM; có thể đặt use_cpu=False để chạy trên GPU (chỉ cho layer nhỏ).
         """
-        # đảm bảo dạng 2D và float
         W_old_2d = W_old.view(W_old.size(0), -1).float()
         W_new_2d = W_new.view(W_new.size(0), -1).float()
 
-        if use_cpu:
-            device_calc = torch.device("cpu")
-        else:
-            device_calc = self._device
-
+        device_calc = torch.device("cpu")  # Luôn dùng CPU để tránh VRAM spike
         W_old_norm = F.normalize(W_old_2d.to(device_calc), p=2, dim=1)
         W_new_norm = F.normalize(W_new_2d.to(device_calc), p=2, dim=1)
 
         n_old = W_old_norm.size(0)
         sims_parts = []
-        # Tính theo batch trên chiều n_old
         for start in range(0, n_old, batch_size):
             end = min(start + batch_size, n_old)
             part = torch.matmul(W_old_norm[start:end], W_new_norm.t())
-            sims_parts.append(part.cpu())  # giữ tạm trên CPU để giảm áp lực RAM/GPU
-
-        R = torch.cat(sims_parts, dim=0)  # trên CPU
-        return R  # R ở CPU
+            sims_parts.append(part.cpu())  # Lưu trên CPU
+            del part  # Xóa ngay để giải phóng RAM
+            torch.cuda.empty_cache()  # Giải phóng VRAM nếu có
+        R = torch.cat(sims_parts, dim=0)
+        del sims_parts, W_old_norm, W_new_norm  # Giải phóng bộ nhớ
+        return R
 
     def _compute_permutation_matrix(self, R, layer):
         """
-        Trả về P kích thước (n_old, n_new) (hàng là old, cột là new).
-        Với tau < 0.1 -> Hungarian (one-hot rows)
-        Ngược lại -> Sinkhorn (doubly-stochastic approx)
+        Trả về P kích thước (n_old, n_new).
+        Với tau < 0.1 -> Hungarian; ngược lại -> Sinkhorn.
         """
         if R.numel() == 0 or R.dim() != 2:
             raise ValueError(f"Input R invalid: {R.shape}")
 
-        # tối đa hoá similarity => minimize -R
         cost = -R
-
         n_old, n_new = R.shape
 
         if self.tau < 0.1:
-            # Hungarian (chi phí trên CPU numpy)
             row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
             P = torch.zeros((n_old, n_new), device=torch.device("cpu"), dtype=torch.float32)
             P[row_ind, col_ind] = 1.0
             return P
         else:
-            # Sinkhorn: chúng ta sẽ thực hiện triển khai trên device self._device
-            a = torch.full((n_old,), 1.0 / n_old, dtype=torch.float32, device=self._device)
-            b = torch.full((n_new,), 1.0 / n_new, dtype=torch.float32, device=self._device)
-            M = (-R).to(dtype=torch.float32)  # R có thể đang ở CPU
-            # gọi sinkhorn; trong sinkhorn sẽ move M -> self._device
-            P = self.sinkhorn_torch(M=M, a=a, b=b, lambda_sh=1.0, numItermax=self.E, stopThr=1e-4,
-                                    cuda=(self._device.type == 'cuda'))
-            return P.cpu() if P.device != torch.device("cpu") else P
+            a = torch.full((n_old,), 1.0 / n_old, dtype=torch.float32, device=torch.device("cpu"))
+            b = torch.full((n_new,), 1.0 / n_new, dtype=torch.float32, device=torch.device("cpu"))
+            M = (-R).to(dtype=torch.float32)
+            P = self.sinkhorn_torch(M=M, a=a, b=b, lambda_sh=1.0, numItermax=1000, stopThr=1e-4, cuda=False)
+            return P
 
-    def sinkhorn_torch(self, M, a, b, lambda_sh, numItermax=5000, stopThr=5e-3, cuda=False):
+    def sinkhorn_torch(self, M, a, b, lambda_sh, numItermax=1000, stopThr=1e-4, cuda=False):
         """
         Trả về P ~ argmin <P,M> s.t. P1=a, P^T1=b, P>=0
-        K = exp(-lambda*M); cập nhật u,v; cuối cùng P = diag(u) K diag(v) = outer(u,v)*K
-        Lưu ý: M có thể là CPU tensor; ta convert về device self._device để tính (nhưng P có thể to lớn)
         """
-        device = self._device if cuda else torch.device("cpu")
+        device = torch.device("cpu")  # Luôn dùng CPU
         M = M.to(dtype=torch.float32, device=device)
         a = a.to(dtype=torch.float32, device=device)
         b = b.to(dtype=torch.float32, device=device)
 
-        # tránh overflow/underflow
-        K = torch.exp(-lambda_sh * M).clamp_min(1e-12)
-        u = torch.ones_like(a) / a.size(0)
-        v = torch.ones_like(b) / b.size(0)
+        with torch.no_grad():
+            K = torch.exp(-lambda_sh * M).clamp_min(1e-12)
+            u = torch.ones_like(a) / a.size(0)
+            v = torch.ones_like(b) / b.size(0)
 
-        err = float('inf')
-        for it in range(int(numItermax)):
-            Kv = K @ v
-            Kv = Kv.clamp_min(1e-12)
-            u = a / Kv
+            err = float('inf')
+            for it in range(int(numItermax)):
+                Kv = K @ v
+                Kv = Kv.clamp_min(1e-12)
+                u = a / Kv
 
-            KTu = K.t() @ u
-            KTu = KTu.clamp_min(1e-12)
-            v = b / KTu
+                KTu = K.t() @ u
+                KTu = KTu.clamp_min(1e-12)
+                v = b / KTu
 
-            if it % 20 == 0:
-                b_est = v * (K.t() @ u)
-                err = torch.norm(b_est - b, p=float('inf')).item()
-                if err < stopThr:
-                    break
+                if it % 20 == 0:
+                    b_est = v * (K.t() @ u)
+                    err = torch.norm(b_est - b, p=float('inf')).item()
+                    if err < stopThr:
+                        break
 
-        P = (u[:, None] * K) * v[None, :]
+            P = (u[:, None] * K) * v[None, :]
+            del K, u, v  # Giải phóng tensor tạm
+            torch.cuda.empty_cache()
         return P
 
     # ----------------------- training -----------------------
@@ -508,32 +483,42 @@ class LwI(BaseLearner):
                 shot=self.shot,
                 ret_data=True
             )
-            # giảm num_workers để tránh RAM spike
-            idx_loader = DataLoader(idx_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-            vectors, _ = self._extract_vectors(idx_loader)  # numpy [N, fe]
-            class_mean = np.mean(vectors, axis=0)  # [fe]
-            cov = np.dot(vectors.T, vectors)  # [fe, fe]
+            idx_loader = DataLoader(idx_dataset, batch_size=64, shuffle=False, num_workers=0)  # Giảm batch_size, tắt workers
             fe = self.al_classifier.fe_size
+            cov_sum = torch.zeros(fe, fe, device=self._device)
+            proto_sum = torch.zeros(fe, device=self._device)
+            count = 0
 
-            proto_t = torch.tensor(class_mean, dtype=torch.float32, device=self._device).view(1, -1)
-            cov_t = torch.tensor(cov, dtype=torch.float32, device=self._device)
-            # bảo vệ shape
-            if proto_t.shape[1] != fe:
-                logging.warning(f"[Protos] feature size mismatch proto:{proto_t.shape[1]} vs fe:{fe}")
-                # resize nếu cần
-                if proto_t.shape[1] > fe:
-                    proto_t = proto_t[:, :fe]
+            with torch.no_grad():
+                for _, (_, inputs, _) in enumerate(idx_loader):
+                    inputs = inputs.to(self._device)
+                    feats = self._network(inputs)["features"]  # [batch, fe]
+                    cov_sum += feats.t() @ feats  # Tích lũy covariance
+                    proto_sum += feats.sum(dim=0)  # Tích lũy mean
+                    count += feats.size(0)
+                    del feats  # Giải phóng ngay
+                    torch.cuda.empty_cache()
+
+            class_mean = proto_sum / count
+            cov_t = cov_sum / count
+
+            if class_mean.shape[0] != fe:
+                logging.warning(f"[Protos] feature size mismatch proto:{class_mean.shape[0]} vs fe:{fe}")
+                if class_mean.shape[0] > fe:
+                    class_mean = class_mean[:fe]
                     cov_t = cov_t[:fe, :fe]
                 else:
-                    pad = fe - proto_t.shape[1]
-                    proto_t = F.pad(proto_t, (0, pad))
+                    pad = fe - class_mean.shape[0]
+                    class_mean = F.pad(class_mean, (0, pad))
                     cov_pad = torch.zeros((fe, fe), device=self._device)
                     cov_pad[:cov_t.shape[0], :cov_t.shape[1]] = cov_t
                     cov_t = cov_pad
 
-            self._protos[class_idx] = proto_t.squeeze(0)
+            self._protos[class_idx] = class_mean
             self._covs[class_idx] = cov_t
             self._projectors[class_idx] = self.get_projector_svd(cov_t)
+            del cov_sum, proto_sum  # Giải phóng bộ nhớ
+            torch.cuda.empty_cache()
 
     # ----------------------- epoch loops -----------------------
 
