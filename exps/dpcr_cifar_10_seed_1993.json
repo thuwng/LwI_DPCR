@@ -29,6 +29,8 @@
     "geom_ensemble_type": "none",
     "normalize_wts": false,
     "act_num_samples": 1.0,
-    "debug": false,
-    "clip_gm": true
+    "debug": true,
+    "clip_gm": true,
+    "no_data_parallel": true,
+    "do_ot_alignment": false
 }

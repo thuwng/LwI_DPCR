@@ -14,7 +14,9 @@ from torchvision import transforms
 from utils.autoaugment import CIFAR10Policy
 from scipy.optimize import linear_sum_assignment
 import math
+import traceback
 
+# ---------------- hyperparams (same semantics as before) ----------------
 init_epoch = 2  # test
 init_lr = 0.1
 init_milestones = [60, 120, 160]
@@ -26,33 +28,50 @@ epochs = 100
 lrate = 0.05
 milestones = [45, 90]
 lrate_decay = 0.1
-# batch_size now set by JSON/config when creating trainer; keep default here for safety
-batch_size = 32
+batch_size = 16  # mặc định (cấu hình lấy từ JSON)
 weight_decay = 2e-4
-num_workers = 0  # tắt workers để giảm RAM
+num_workers = 0
 T = 2
 lamda = 10
 k = 0.5  # fuse blend
 
 EPSILON = 1e-8
 
+# ---------------- helper utils ----------------
+def print_mem(tag=""):
+    if torch.cuda.is_available():
+        print(f"[MEM] {tag} Allocated={torch.cuda.memory_allocated()/1e9:.3f} GB, Reserved={torch.cuda.memory_reserved()/1e9:.3f} GB")
+    else:
+        print(f"[MEM] {tag} (no CUDA)")
+
+def safe_cuda_empty():
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 def _KD_loss(pred, soft, T):
+    # both pred and soft must be on same device
     pred = torch.log_softmax(pred / T, dim=1)
     soft = torch.softmax(soft / T, dim=1)
     return -1 * torch.mul(soft, pred).sum() / pred.shape[0]
 
-
+# ---------------- main class ----------------
 class LwI(BaseLearner):
     """
-    Bản đã vá để tránh OOM và fix shape mismatch khi fuse weight.
-    Chính: giữ DPCR nguyên vẹn, nhưng đưa ma trận lớn và mô hình cũ về CPU.
+    Giữ nguyên logic DPCR nhưng đảm bảo:
+    - tất cả ma trận tích lũy lớn ở trên CPU
+    - _fuse_weights chạy hoàn toàn trên CPU và set weights cho old_network trên CPU
+    - tránh DataParallel/tránh duplicate model trên nhiều GPU
+    - thêm debug memory logging (bật bằng args['debug']=True)
     """
 
     def __init__(self, args):
         super().__init__(args)
         self.args = args
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # device chọn GPU nếu có, mặc định cuda:0
+        self._device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self._cpu = torch.device("cpu")
 
         # hyper
         self.tau = args.get("tau", 0.1)
@@ -78,63 +97,67 @@ class LwI(BaseLearner):
         self._network.split_layers()
 
         self._old_network = None
-        # đổi sang dict để index theo class id
-        # LƯU Ý: lưu _protos và _covs **trên CPU** để giảm VRAM
+        # LƯU TRỮ TRÊN CPU: protos, covs, projectors -> tránh giữ trên GPU
         self._protos = {}
         self._covs = {}
         self._projectors = {}
 
-        # AL classifier
+        # AL classifier - đặt trên device (GPU) bởi vì inference/weight cuối cần trên GPU
         self.al_classifier = ALClassifier(512, 0, 0, self._device, args=self.args).to(self._device)
         for _, p in self.al_classifier.named_parameters():
             p.requires_grad = False
 
         self._known_classes = 0
 
-    # ----------------------- life-cycle -----------------------
+        # Option flags
+        self.no_data_parallel = args.get("no_data_parallel", True)
+        self.do_ot_alignment = args.get("do_ot_alignment", False)
+        self.debug_mode = args.get("debug", False)
 
+    # ---------------- lifecycle ----------------
     def after_task(self):
-        # Lưu bản sao cũ => giữ trên CPU để giảm VRAM
+        # copy old network and keep it on CPU to save VRAM
         self._old_network = self._network.copy().freeze()
-        # chuyển model cũ sang CPU để tránh chiếm VRAM lâu dài
         try:
-            self._old_network.to(torch.device("cpu"))
+            self._old_network.to(self._cpu)
         except Exception:
-            # nếu model đã ở CPU thì ok
             pass
+
+        # free GPU cache
+        safe_cuda_empty()
 
         self._known_classes = self._total_classes
         if not self.args.get('resume', False):
             if not os.path.exists(self.args["model_dir"]):
                 os.makedirs(self.args["model_dir"])
-            # hợp nhất trọng số giữa old và new (align kênh)
+            # fuse weights (on CPU)
+            if self.debug_mode:
+                print_mem("before _fuse_weights in after_task")
             self._fuse_weights()
+            if self.debug_mode:
+                print_mem("after _fuse_weights in after_task")
             self.save_checkpoint("{}".format(self.args["model_dir"]))
+        safe_cuda_empty()
 
-        # dọn cache GPU
-        torch.cuda.empty_cache()
-
-    # ----------------------- weight fusion -----------------------
-
+    # ---------------- weight fusion ----------------
     @torch.no_grad()
     def _fuse_weights(self):
         """
-        Align & fuse theo chiều out_features/out_channels.
-        Toàn bộ matmul lớn thực hiện trên CPU (đã cố gắng).
+        Compute similarity and fuse weights entirely on CPU to avoid VRAM spikes.
         """
         if self._old_network is None or self._network is None:
             return
 
-        for layer in range(2, 5):  # các layer đã split
+        for layer in range(2, 5):
             W_old = self._old_network.get_layer_weights(layer)
             W_new = self._network.get_layer_weights(layer)
 
             if W_old is None or W_new is None:
                 continue
 
-            # ensure float32
-            W_old = W_old.to(dtype=torch.float32).cpu()
-            W_new = W_new.to(dtype=torch.float32).cpu()
+            # ensure CPU float32 -> avoid any GPU copy
+            W_old = W_old.detach().float().to(self._cpu)
+            W_new = W_new.detach().float().to(self._cpu)
 
             W_old_2d, shape_old = self._flatten_out_first(W_old)
             W_new_2d, shape_new = self._flatten_out_first(W_new)
@@ -143,44 +166,39 @@ class LwI(BaseLearner):
             n_out_new, feat_new = W_new_2d.shape
 
             if feat_old != feat_new:
-                logging.warning(
-                    f"[Fuse] skip layer {layer}: feature dim mismatch old({feat_old}) vs new({feat_new})"
-                )
+                logging.warning(f"[Fuse] skip layer {layer}: feature dim mismatch old({feat_old}) vs new({feat_new})")
                 continue
+
+            if self.debug_mode:
+                print_mem(f"fuse_weights layer {layer} - before similarity")
 
             R = self._compute_similarity(W_old_2d, W_new_2d, batch_size=1024, use_cpu=True)
             P = self._compute_permutation_matrix(R, layer)
-            P_left = P.t().contiguous().to(dtype=torch.float32)
+            P_left = P.t().contiguous().to(dtype=torch.float32, device=self._cpu)
 
             if P_left.shape != (n_out_new, n_out_old):
                 raise ValueError(f"P_left shape invalid: {P_left.shape}, expected {(n_out_new, n_out_old)}")
 
-            # matmul trên CPU
-            device_for_matmul = torch.device("cpu")
-            aligned_old = torch.matmul(P_left.to(device_for_matmul), W_old_2d.to(device_for_matmul))
+            # aligned_old on CPU
+            aligned_old = torch.matmul(P_left, W_old_2d)  # CPU matmul
 
             if layer == 2:
                 W_fused_2d = aligned_old
             else:
-                # W_new_2d đang ở CPU
-                W_fused_2d = k * aligned_old + (1 - k) * W_new_2d.to(device_for_matmul)
+                W_fused_2d = k * aligned_old + (1 - k) * W_new_2d
 
-            # di chuyển kết quả được fuse lên GPU target model (nhỏ)
-            W_fused = W_fused_2d.view(*shape_new).to(self._device)
+            # IMPORTANT: keep fused weights on CPU and set them into old_network on CPU
+            W_fused = W_fused_2d.view(*shape_new).to(self._cpu)
             self._old_network.set_layer_weights(layer, W_fused)
 
-            # Giải phóng bộ nhớ CPU tạm
-            del R, P, P_left, W_old_2d, W_new_2d, aligned_old, W_fused_2d
-            torch.cuda.empty_cache()
+            # free intermediate CPU tensors
+            del R, P, P_left, W_old_2d, W_new_2d, aligned_old, W_fused_2d, W_fused
+            safe_cuda_empty()
+
+        if self.debug_mode:
+            print_mem("after _fuse_weights")
 
     def _flatten_out_first(self, W):
-        """
-        Đưa trọng số về (n_out, -1) theo chuẩn PyTorch:
-        - Linear: (out_features, in_features) -> (out_features, in_features)
-        - Conv: (out_channels, in_channels, kH, kW) -> (out_channels, in_channels*kH*kW)
-        - BatchNorm/others 1D: (num_features,) -> (num_features, 1)
-        Trả về (W_2d, original_shape)
-        """
         if W.dim() == 2:
             shape = W.shape
             return W, shape
@@ -195,34 +213,25 @@ class LwI(BaseLearner):
             raise ValueError(f"Unsupported weight dim: {W.shape}")
 
     def _compute_similarity(self, W_old, W_new, batch_size=1024, use_cpu=True):
-        """
-        Tính cosine similarity giữa các hàng của W_old và W_new theo batch.
-        Triển khai hoàn toàn trên CPU để tránh spike VRAM.
-        """
-        # đảm bảo trên CPU
-        W_old_2d = W_old.view(W_old.size(0), -1).float().cpu()
-        W_new_2d = W_new.view(W_new.size(0), -1).float().cpu()
+        # Force CPU computation
+        W_old_2d = W_old.view(W_old.size(0), -1).float().to(self._cpu)
+        W_new_2d = W_new.view(W_new.size(0), -1).float().to(self._cpu)
 
-        device_calc = torch.device("cpu")
-        W_old_norm = F.normalize(W_old_2d.to(device_calc), p=2, dim=1)
-        W_new_norm = F.normalize(W_new_2d.to(device_calc), p=2, dim=1)
+        W_old_norm = F.normalize(W_old_2d, p=2, dim=1)
+        W_new_norm = F.normalize(W_new_2d, p=2, dim=1)
 
         n_old = W_old_norm.size(0)
         sims_parts = []
         for start in range(0, n_old, batch_size):
             end = min(start + batch_size, n_old)
             part = torch.matmul(W_old_norm[start:end], W_new_norm.t())
-            sims_parts.append(part)  # trên CPU
+            sims_parts.append(part)
             del part
         R = torch.cat(sims_parts, dim=0)
         del sims_parts, W_old_norm, W_new_norm
-        return R
+        return R  # CPU tensor
 
     def _compute_permutation_matrix(self, R, layer):
-        """
-        Trả về P kích thước (n_old, n_new).
-        Với tau < 0.1 -> Hungarian; ngược lại -> Sinkhorn.
-        """
         if R.numel() == 0 or R.dim() != 2:
             raise ValueError(f"Input R invalid: {R.shape}")
 
@@ -231,22 +240,18 @@ class LwI(BaseLearner):
 
         if self.tau < 0.1:
             row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
-            P = torch.zeros((n_old, n_new), device=torch.device("cpu"), dtype=torch.float32)
+            P = torch.zeros((n_old, n_new), device=self._cpu, dtype=torch.float32)
             P[row_ind, col_ind] = 1.0
             return P
         else:
-            a = torch.full((n_old,), 1.0 / n_old, dtype=torch.float32, device=torch.device("cpu"))
-            b = torch.full((n_new,), 1.0 / n_new, dtype=torch.float32, device=torch.device("cpu"))
-            M = (-R).to(dtype=torch.float32)
+            a = torch.full((n_old,), 1.0 / n_old, dtype=torch.float32, device=self._cpu)
+            b = torch.full((n_new,), 1.0 / n_new, dtype=torch.float32, device=self._cpu)
+            M = (-R).to(dtype=torch.float32, device=self._cpu)
             P = self.sinkhorn_torch(M=M, a=a, b=b, lambda_sh=1.0, numItermax=1000, stopThr=1e-4, cuda=False)
             return P
 
     def sinkhorn_torch(self, M, a, b, lambda_sh, numItermax=1000, stopThr=1e-4, cuda=False):
-        """
-        Trả về P ~ argmin <P,M> s.t. P1=a, P^T1=b, P>=0
-        Thực hiện trên CPU.
-        """
-        device = torch.device("cpu")
+        device = self._cpu
         M = M.to(dtype=torch.float32, device=device)
         a = a.to(dtype=torch.float32, device=device)
         b = b.to(dtype=torch.float32, device=device)
@@ -274,16 +279,15 @@ class LwI(BaseLearner):
 
             P = (u[:, None] * K) * v[None, :]
             del K, u, v
-            torch.cuda.empty_cache()
+            safe_cuda_empty()
         return P
 
-    # ----------------------- training -----------------------
-
+    # ---------------- training ----------------
     def incremental_train(self, data_manager):
         self.data_manager = data_manager
         self._cur_task += 1
 
-        # augment hợp lý: ToTensor cuối cùng
+        # augment transforms
         ds = self.args.get('dataset', '').lower()
         if ds == "cifar100":
             self.data_manager._train_trsf = [
@@ -323,7 +327,6 @@ class LwI(BaseLearner):
         logging.info("Learning on {}-{}".format(self._known_classes, self._total_classes))
 
         self.shot = None
-        # batch_size lấy từ config/biến global
         bs = self.args.get("batch_size", batch_size)
         nw = self.args.get("num_workers", num_workers)
 
@@ -337,22 +340,23 @@ class LwI(BaseLearner):
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
         self.test_loader = DataLoader(test_dataset, batch_size=bs, shuffle=False, num_workers=nw)
 
-        if len(self._multiple_gpus) > 1:
-            # DataParallel thường làm tăng overhead; nếu bạn dùng multi-GPU, cân nhắc tắt
+        # avoid DataParallel if requested
+        if not self.no_data_parallel and len(self._multiple_gpus) > 1:
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
+
+        # ensure network (current) on GPU for training
+        self._network.to(self._device)
+        if hasattr(self._network, "module"):
+            self._network_module_ptr = self._network.module
 
         self._train(self.train_loader, self.test_loader)
 
-        if len(self._multiple_gpus) > 1:
+        # if wrapped, unwrap
+        if not self.no_data_parallel and len(self._multiple_gpus) > 1:
             self._network = self._network.module
 
     def _train(self, train_loader, test_loader):
         resume = self.args.get('resume', False)
-
-        # chuyển network chính lên GPU (chỉ network hiện tại)
-        self._network.to(self._device)
-        if hasattr(self._network, "module"):
-            self._network_module_ptr = self._network.module
 
         if self._cur_task == 0:
             if resume:
@@ -367,29 +371,38 @@ class LwI(BaseLearner):
                 scheduler = optim.lr_scheduler.MultiStepLR(optimizer=optimizer, milestones=init_milestones, gamma=init_lr_decay)
                 self._init_train(train_loader, test_loader, optimizer, scheduler)
 
-            # AL closed-form
-            self._network.eval()
-            cov = torch.zeros(self.al_classifier.fe_size, self.al_classifier.fe_size, device=self._device)
-            crs_cor = torch.zeros(self.al_classifier.fe_size, self._total_classes, device=self._device)
+            # --- AL closed-form: do accumulation on CPU to save VRAM ---
+            if self.debug_mode:
+                print_mem("before AL closed-form (task 0)")
+
+            cov = torch.zeros(self.al_classifier.fe_size, self.al_classifier.fe_size, device=self._cpu)
+            crs_cor = torch.zeros(self.al_classifier.fe_size, self._total_classes, device=self._cpu)
             with torch.no_grad():
                 for _, (_, inputs, targets) in enumerate(tqdm(train_loader, desc='Analytic Learning Phase=0', unit='batch')):
-                    inputs, targets = inputs.to(self._device), targets.to(self._device)
-                    out_backbone = self._network(inputs)["features"]
+                    inputs_cpu = inputs  # dataloader yields CPU tensors
+                    inputs_gpu = inputs_cpu.to(self._device)
+                    out_backbone = self._network(inputs_gpu)["features"]
                     out_fe, _ = self.al_classifier(out_backbone)
+                    out_fe_cpu = out_fe.detach().cpu()
                     label_onehot = F.one_hot(targets, self._total_classes).float()
-                    cov += out_fe.t() @ out_fe
-                    crs_cor += out_fe.t() @ label_onehot
+                    cov += out_fe_cpu.t() @ out_fe_cpu
+                    crs_cor += out_fe_cpu.t() @ label_onehot
+                    del out_backbone, out_fe, out_fe_cpu, label_onehot
+                    safe_cuda_empty()
 
-            self.al_classifier.cov = self.al_classifier.cov + cov
-            self.al_classifier.R = self.al_classifier.R + cov
-            self.al_classifier.Q = self.al_classifier.Q + crs_cor
+            # keep accumulators on CPU, compute inverse on CPU
+            self.al_classifier.cov = (self.al_classifier.cov.cpu() + cov).cpu()
+            self.al_classifier.R = (self.al_classifier.R.cpu() + cov).cpu()
+            self.al_classifier.Q = (self.al_classifier.Q.cpu() + crs_cor).cpu()
 
-            R_inv = torch.inverse(self.al_classifier.R.cpu()).to(self._device)
-            Delta = R_inv @ self.al_classifier.Q
-            self.al_classifier.fc.weight = torch.nn.Parameter(F.normalize(Delta.t().float(), p=2, dim=-1))
+            R_inv = torch.inverse(self.al_classifier.R).to(self._cpu)  # CPU
+            Delta = R_inv @ self.al_classifier.Q  # CPU
+            # normalize and set fc weight on GPU
+            self.al_classifier.fc.weight = torch.nn.Parameter(F.normalize(Delta.t().float(), p=2, dim=-1).to(self._device))
 
-            # build protos lưu trên CPU để giảm VRAM
             self._build_protos()
+            safe_cuda_empty()
+
         else:
             if resume:
                 checkpoint_path = f"{self.args['model_dir']}{self._total_classes}_model.pth.tar"
@@ -398,14 +411,11 @@ class LwI(BaseLearner):
                 print(f"Loading checkpoint: {checkpoint_path}")
                 self._network.load_state_dict(torch.load(checkpoint_path)["state_dict"], strict=False)
 
-            # network mới trên GPU
-            self._network.to(self._device)
-            if hasattr(self._network, "module"):
-                self._network_module_ptr = self._network.module
-            # ensure old network is on CPU to save VRAM (we'll run old forwards on CPU)
+            # network already moved to GPU by incremental_train
             if self._old_network is not None:
+                # ensure old network stays on CPU (we will forward on CPU)
                 try:
-                    self._old_network.to(torch.device("cpu"))
+                    self._old_network.to(self._cpu)
                 except Exception:
                     pass
 
@@ -414,118 +424,103 @@ class LwI(BaseLearner):
                 scheduler = optim.lr_scheduler.MultiStepLR(optimizer=optimizer, milestones=milestones, gamma=lrate_decay)
                 self._update_representation(train_loader, test_loader, optimizer, scheduler)
 
-            # build protos lưu trên CPU
             self._build_protos()
 
-            # -------- DPCR/Drift Estimation (giữ nguyên logic, chuyển tính toán lớn về CPU) --------
+            # DPCR: giữ nguyên logic, nhưng tất cả ma trận tích lũy lớn trên CPU
             if self.args.get("DPCR", False):
+                if self.debug_mode:
+                    print_mem("before DPCR accumulation")
                 print('Using DPCR')
-                if self.al_classifier is None:
-                    raise ValueError("ALClassifier is not initialized!")
 
-                # projector (small) khởi tạo trên device phù hợp, nhưng ma trận lớn tích lũy trên CPU
-                self.projector = Drift_Estimator(512, False, self.args).to(self._device)
+                # instantiate projector on CPU to avoid holding extra params on GPU
+                self.projector = Drift_Estimator(512, False, self.args).to(self._cpu)
                 for _, p in self.projector.named_parameters():
                     p.requires_grad = False
                 self.projector.eval()
 
-                # Tất cả accumulation tensors để trên CPU để tránh VRAM spike
-                cov_pwdr = (self.projector.rg_tssp * torch.eye(self.projector.fe_size, device='cpu')).float()
-                crs_cor_pwdr = torch.zeros(self.projector.fe_size, self.projector.fe_size, device='cpu')
+                # accumulators on CPU
+                cov_pwdr = (self.projector.rg_tssp * torch.eye(self.projector.fe_size, device=self._cpu)).float()
+                crs_cor_pwdr = torch.zeros(self.projector.fe_size, self.projector.fe_size, device=self._cpu)
+                crs_cor_new = torch.zeros(self.al_classifier.fe_size, self._total_classes, device=self._cpu)
+                cov_new = torch.zeros(self.projector.fe_size, self.projector.fe_size, device=self._cpu)
 
-                crs_cor_new = torch.zeros(self.al_classifier.fe_size, self._total_classes, device='cpu')
-                cov_new = torch.zeros(self.projector.fe_size, self.projector.fe_size, device='cpu')
-
-                # Lặp qua batches: thực hiện forward của new network trên GPU, của old network trên CPU,
-                # sau đó move feats về CPU để cộng dồn trên CPU
+                # iterate batches: forward new on GPU, old on CPU, move features to CPU and accumulate
                 with torch.no_grad():
                     for _, (_, inputs, targets) in enumerate(tqdm(self.train_loader, desc='DPCR accumulation', unit='batch')):
-                        # inputs, targets từ dataloader ban đầu ở CPU
-                        inputs_cpu = inputs  # trên CPU
-                        targets_cpu = targets  # trên CPU
-
-                        # forward new model trên GPU, lấy feature, đưa về CPU
-                        inputs_gpu = inputs_cpu.to(self._device, non_blocking=False)
+                        inputs_cpu = inputs  # CPU
+                        # new network forward on GPU
+                        inputs_gpu = inputs_cpu.to(self._device)
                         feats_new_gpu = self._network(inputs_gpu)["features"]
                         feats_new = feats_new_gpu.detach().cpu()
                         del feats_new_gpu
-                        torch.cuda.empty_cache()
+                        safe_cuda_empty()
 
-                        # forward old model (nếu có) trên CPU để tránh chuyển model cũ lên GPU
+                        # old network forward on CPU (old_network stays on CPU), if not present use zeros
                         if self._old_network is not None:
                             feats_old = self._old_network(inputs_cpu)["features"].detach().cpu()
                         else:
-                            # nếu không có old network, dùng zeros
-                            feats_old = torch.zeros_like(feats_new, device='cpu')
+                            feats_old = torch.zeros_like(feats_new, device=self._cpu)
 
-                        # cập nhật các ma trận tích lũy trên CPU
                         cov_pwdr += feats_old.t() @ feats_old
                         cov_new += feats_new.t() @ feats_new
                         crs_cor_pwdr += feats_old.t() @ feats_new
-
-                        label_onehot = F.one_hot(targets_cpu, self._total_classes).float()  # CPU
+                        label_onehot = F.one_hot(targets, self._total_classes).float()
                         crs_cor_new += feats_new.t() @ label_onehot
 
-                        # giải phóng
                         del feats_old, feats_new, label_onehot
-                        torch.cuda.empty_cache()
+                        safe_cuda_empty()
 
-                # bây giờ đặt các ma trận vào projector (copy nhỏ lên device khi cần)
-                self.projector.cov = cov_pwdr.to(self._device)
-                self.projector.Q = crs_cor_pwdr.to(self._device)
-
-                # inverse trên CPU rồi chuyển ngược nhỏ lên GPU (nếu cần)
-                R_inv = torch.inverse(cov_pwdr).to(self._device)
-                Delta = R_inv @ crs_cor_pwdr.to(self._device)
+                # now set projector weights using CPU matrices (compute inverse on CPU)
+                self.projector.cov = cov_pwdr
+                self.projector.Q = crs_cor_pwdr
+                R_inv = torch.inverse(cov_pwdr)
+                Delta = R_inv @ crs_cor_pwdr
+                # set projector.fc weight on CPU (keep projector on CPU)
                 self.projector.fc.weight = torch.nn.Parameter(Delta.t().float())
 
-                # build al_classifier cov/Q/R trên CPU (lưu trữ chính trên CPU)
-                cov_prime = torch.zeros(self.al_classifier.fe_size, self.al_classifier.fe_size, device='cpu')
-                Q_prime = torch.zeros(self.al_classifier.fe_size, self.al_classifier.num_classes, device='cpu')
+                # aggregate primes on CPU and update al_classifier's cov/Q/R (store mostly on CPU)
+                cov_prime = torch.zeros(self.al_classifier.fe_size, self.al_classifier.fe_size, device=self._cpu)
+                Q_prime = torch.zeros(self.al_classifier.fe_size, self.al_classifier.num_classes, device=self._cpu)
 
-                # duyệt các class đã biết: tính dạng CPU để hạn chế VRAM
                 for class_idx in range(0, self._known_classes):
                     if class_idx not in self._projectors or class_idx not in self._covs or class_idx not in self._protos:
-                        # nếu thiếu, bỏ qua class này
                         continue
 
-                    # _projectors[class_idx], _covs[class_idx], _protos[class_idx] ta đã lưu trên CPU trong _build_protos
-                    W = (self.projector.get_weight().cpu()) @ self._projectors[class_idx].cpu()
+                    # all stored on CPU
+                    W = self.projector.get_weight().cpu() @ self._projectors[class_idx].cpu()
                     cov_idx = self._covs[class_idx].cpu()
                     cov_prime_idx = W.t() @ cov_idx @ W
-                    label_onehot = F.one_hot(torch.tensor(class_idx, device='cpu'), self._total_classes).float()
+                    label_onehot = F.one_hot(torch.tensor(class_idx, device=self._cpu), self._total_classes).float()
                     cor_prime_idx = self.num_per_class * (W.t() @ self._protos[class_idx].view(-1, 1).cpu()) @ label_onehot.view(1, self._total_classes)
 
                     cov_prime += cov_prime_idx
                     Q_prime += cor_prime_idx
 
-                    # cập nhật từng class (lưu lại trên CPU)
+                    # update stored per-class things on CPU
                     self._covs[class_idx] = cov_prime_idx.cpu()
                     self._projectors[class_idx] = self.get_projector_svd(cov_prime_idx.cpu())
                     self._protos[class_idx] = (self._protos[class_idx].cpu() @ W).contiguous().cpu()
 
                     del W, cov_idx, cov_prime_idx, cor_prime_idx, label_onehot
-                    torch.cuda.empty_cache()
+                    safe_cuda_empty()
 
-                # R_prime tính trên CPU
-                R_prime = cov_prime + (self.al_classifier.gamma * torch.eye(self.al_classifier.fe_size, device='cpu'))
-                # cập nhật các thành phần của al_classifier: lưu trên CPU để tiết kiệm VRAM
+                R_prime = cov_prime + (self.al_classifier.gamma * torch.eye(self.al_classifier.fe_size, device=self._cpu))
+                # update classifier accumulators on CPU
                 self.al_classifier.cov = (cov_prime + cov_new).cpu()
                 self.al_classifier.Q = (Q_prime + crs_cor_new).cpu()
-                self.al_classifier.R = R_prime + cov_new.cpu()
+                self.al_classifier.R = (R_prime + cov_new).cpu()
 
-                R_inv = torch.inverse(self.al_classifier.R).to(self._device)
-                Delta = R_inv @ (self.al_classifier.Q.to(self._device))
-                self.al_classifier.fc.weight = torch.nn.Parameter(F.normalize(Delta.t().float(), p=2, dim=-1))
+                R_inv = torch.inverse(self.al_classifier.R).to(self._cpu)
+                Delta = R_inv @ self.al_classifier.Q
+                # final fc weight normalized and moved to GPU
+                self.al_classifier.fc.weight = torch.nn.Parameter(F.normalize(Delta.t().float(), p=2, dim=-1).to(self._device))
 
-                torch.cuda.empty_cache()
+                safe_cuda_empty()
+                if self.debug_mode:
+                    print_mem("after DPCR")
 
     def get_projector_svd(self, raw_matrix, all_non_zeros=True):
-        """
-        Dùng eigh cho ma trận đối xứng dương (cov).
-        Thực hiện trên CPU (raw_matrix dự kiến ở CPU).
-        """
-        # đưa về CPU để an toàn
+        # operate on CPU
         A = raw_matrix.cpu()
         A = 0.5 * (A + A.t())
         S, V = torch.linalg.eigh(A)
@@ -539,12 +534,11 @@ class LwI(BaseLearner):
             r = min(512, V.shape[1])
             left_vectors = V[:, -r:]
         projector = left_vectors @ left_vectors.t()
-        return projector  # projector on CPU
+        return projector  # CPU
 
     def _build_protos(self):
         """
-        Tạo proto/cov/projector cho các class mới, lưu vào dict theo class id.
-        **LƯU Ý**: lưu trữ cov/proto/projector trên CPU để giảm VRAM.
+        Build protos/covs/projectors per class and keep them on CPU (to save GPU VRAM).
         """
         bs_local = min(64, self.args.get("batch_size", batch_size))
         for class_idx in range(self._known_classes, self._total_classes):
@@ -557,35 +551,31 @@ class LwI(BaseLearner):
             )
             idx_loader = DataLoader(idx_dataset, batch_size=bs_local, shuffle=False, num_workers=0)
             fe = self.al_classifier.fe_size
-            # đặt accumulation trên CPU
-            cov_sum = torch.zeros(fe, fe, device='cpu')
-            proto_sum = torch.zeros(fe, device='cpu')
+            cov_sum = torch.zeros(fe, fe, device=self._cpu)
+            proto_sum = torch.zeros(fe, device=self._cpu)
             count = 0
 
             with torch.no_grad():
                 for _, (_, inputs, _) in enumerate(idx_loader):
-                    # inputs ban đầu trên CPU => forward new network trên GPU, đưa feature về CPU
                     inputs_cpu = inputs
-                    inputs_gpu = inputs_cpu.to(self._device, non_blocking=False)
+                    inputs_gpu = inputs_cpu.to(self._device)
                     feats_gpu = self._network(inputs_gpu)["features"]
                     feats = feats_gpu.detach().cpu()
                     del feats_gpu
-                    torch.cuda.empty_cache()
+                    safe_cuda_empty()
 
                     cov_sum += feats.t() @ feats
                     proto_sum += feats.sum(dim=0)
                     count += feats.size(0)
                     del feats
-                    torch.cuda.empty_cache()
+                    safe_cuda_empty()
 
             if count == 0:
-                # tránh chia cho 0
                 continue
 
             class_mean = proto_sum / count
             cov_t = cov_sum / count
 
-            # đảm bảo kích thước đúng (CPU)
             if class_mean.shape[0] != fe:
                 logging.warning(f"[Protos] feature size mismatch proto:{class_mean.shape[0]} vs fe:{fe}")
                 if class_mean.shape[0] > fe:
@@ -594,19 +584,20 @@ class LwI(BaseLearner):
                 else:
                     pad = fe - class_mean.shape[0]
                     class_mean = F.pad(class_mean, (0, pad))
-                    cov_pad = torch.zeros((fe, fe), device='cpu')
+                    cov_pad = torch.zeros((fe, fe), device=self._cpu)
                     cov_pad[:cov_t.shape[0], :cov_t.shape[1]] = cov_t
                     cov_t = cov_pad
 
-            # lưu trên CPU (để giảm VRAM)
             self._protos[class_idx] = class_mean.cpu()
             self._covs[class_idx] = cov_t.cpu()
             self._projectors[class_idx] = self.get_projector_svd(cov_t.cpu())
             del cov_sum, proto_sum
-            torch.cuda.empty_cache()
+            safe_cuda_empty()
 
-    # ----------------------- epoch loops -----------------------
+        if self.debug_mode:
+            print_mem("after _build_protos")
 
+    # ---------------- epoch loops ----------------
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
         prog_bar = tqdm(range(init_epoch))
         for _, epoch in enumerate(prog_bar):
@@ -625,8 +616,7 @@ class LwI(BaseLearner):
                 _, preds = torch.max(logits, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
-
-                torch.cuda.empty_cache()
+                safe_cuda_empty()
 
             scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
@@ -657,23 +647,29 @@ class LwI(BaseLearner):
                 loss_ot = torch.tensor(0.0, device=self._device, dtype=torch.float32)
 
                 if self._old_network is not None:
-                    # chạy old_network forward trên CPU để tránh giữ cả 2 model trên GPU
-                    # copy inputs về CPU, forward trên CPU, rồi tính KD (trên CPU) và đưa loss về GPU khi cần
+                    # compute old_logits on CPU, then copy to GPU briefly for KD
                     inputs_cpu = inputs.detach().cpu()
                     with torch.no_grad():
-                        old_logits = self._old_network(inputs_cpu)["logits"].to(self._device)
-                    loss_kd = _KD_loss(logits[:, :self._known_classes], old_logits, T)
+                        old_logits_cpu = self._old_network(inputs_cpu)["logits"].detach().cpu()
+                    # move old logits to GPU just for KD (small tensor: [batch, known_classes])
+                    old_logits_gpu = old_logits_cpu.to(self._device)
+                    loss_kd = _KD_loss(logits[:, :self._known_classes], old_logits_gpu, T)
+                    del old_logits_cpu, old_logits_gpu
+                    safe_cuda_empty()
 
-                    # OT alignment (tuỳ codebase của bạn)
-                    try:
-                        aligned_layers, _ = get_wassersteinized_layers_modularized(self.args, self._device,
-                                                                                   [self._old_network, self._network])
-                        for old_param, new_like in zip(self._old_network.parameters(), aligned_layers):
-                            # both old_param and new_like may be on different devices; compare shapes and move to CPU
-                            if old_param.shape == new_like.shape:
-                                loss_ot += F.mse_loss(old_param.to(self._device), new_like)
-                    except Exception as e:
-                        logging.warning(f"[OT] skipped due to: {e}")
+                    # OT alignment: run only if flag set (this often creates many temporaries)
+                    if self.do_ot_alignment:
+                        try:
+                            aligned_layers, _ = get_wassersteinized_layers_modularized(self.args, self._device,
+                                                                                       [self._old_network, self._network])
+                            for old_param, new_like in zip(self._old_network.parameters(), aligned_layers):
+                                if old_param.shape == new_like.shape:
+                                    loss_ot += F.mse_loss(old_param.to(self._device), new_like)
+                            del aligned_layers
+                        except Exception as e:
+                            logging.warning(f"[OT] skipped due to: {e}")
+                            if self.debug_mode:
+                                traceback.print_exc()
 
                 loss = lamda * loss_kd + loss_clf + 0.1 * loss_ot
 
@@ -687,7 +683,7 @@ class LwI(BaseLearner):
                     correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                     total += len(targets)
 
-                torch.cuda.empty_cache()
+                safe_cuda_empty()
 
             scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
