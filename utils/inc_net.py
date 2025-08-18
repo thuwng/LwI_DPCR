@@ -164,63 +164,6 @@ class IncrementalNet(BaseNet):
             forward_hook
         )
 
-    def split_layers(self):
-        """
-        Chia mạng self.convnet thành L1 (input), L2 (shallow), L3 (deep), L4 (output).
-        Giả định cấu trúc ResNet: L1 = conv1, L2 = layer1, L3 = layer2+layer3, L4 = layer4+fc.
-        """
-        if not hasattr(self.convnet, 'conv1') or not hasattr(self.convnet, 'layer1'):
-            raise ValueError("Cấu trúc mạng không khớp với ResNet, cần kiểm tra lại convnet_type.")
-        
-        self.layers = {}
-        self.layers['L1'] = [self.convnet.conv1]  # Lớp input (conv1)
-        self.layers['L2'] = [self.convnet.layer1]  # Lớp nông (shallow)
-        self.layers['L3'] = [self.convnet.layer2, self.convnet.layer3]  # Lớp sâu (deep)
-        self.layers['L4'] = [self.convnet.layer4, self.fc]  # Lớp output (layer4 + fc)
-        print("Mạng đã được chia thành L1, L2, L3, L4.")
-
-    def get_layer_weights(self, layer_num):
-        """
-        Truy xuất trọng số của lớp thứ layer_num (1: L1, 2: L2, 3: L3, 4: L4).
-        Trả về tensor trọng số (weights) flatten.
-        """
-        if layer_num < 1 or layer_num > 4:
-            raise ValueError("Layer phải từ 1 đến 4")
-        layer_key = f'L{layer_num}'
-        if not hasattr(self, 'layers') or layer_key not in self.layers:
-            self.split_layers()  # Chia nếu chưa có
-        layer_modules = self.layers[layer_key]
-        weights = []
-        for module in layer_modules:
-            for name, param in module.named_parameters():
-                if 'weight' in name:  # Chỉ lấy weights, bỏ bias
-                    weights.append(param.data)
-        if not weights:
-            raise ValueError(f"Không tìm thấy trọng số ở lớp {layer_num}")
-        return torch.cat([w.view(-1) for w in weights])  # Flatten để dễ xử lý
-
-    def set_layer_weights(self, layer_num, new_weights):
-        """
-        Cập nhật trọng số của lớp thứ layer_num từ new_weights.
-        new_weights phải là tensor flatten, sẽ reshape lại để khớp với param gốc.
-        """
-        if layer_num < 1 or layer_num > 4:
-            raise ValueError("Layer phải từ 1 đến 4")
-        layer_key = f'L{layer_num}'
-        if not hasattr(self, 'layers') or layer_key not in self.layers:
-            self.split_layers()
-        layer_modules = self.layers[layer_key]
-        idx = 0
-        for module in layer_modules:
-            for name, param in module.named_parameters():
-                if 'weight' in name:
-                    param_size = param.numel()
-                    param.data = new_weights[idx:idx + param_size].view_as(param)
-                    idx += param_size
-        if idx != new_weights.numel():
-            raise ValueError("Kích thước new_weights không khớp")
-        print(f"Trọng số lớp {layer_num} đã được cập nhật.")
-
 class IL2ANet(IncrementalNet):
 
     def update_fc(self, num_old, num_total, num_aux):
@@ -263,63 +206,6 @@ class CosineIncrementalNet(BaseNet):
             )
 
         return fc
-    
-    def split_layers(self):
-        """
-        Chia mạng self.convnet thành L1 (input), L2 (shallow), L3 (deep), L4 (output).
-        Giả định cấu trúc ResNet: L1 = conv1, L2 = layer1, L3 = layer2+layer3, L4 = layer4+fc.
-        """
-        if not hasattr(self.convnet, 'conv1') or not hasattr(self.convnet, 'layer1'):
-            raise ValueError("Cấu trúc mạng không khớp với ResNet, cần kiểm tra lại convnet_type.")
-        
-        self.layers = {}
-        self.layers['L1'] = [self.convnet.conv1]  # Lớp input (conv1)
-        self.layers['L2'] = [self.convnet.layer1]  # Lớp nông (shallow)
-        self.layers['L3'] = [self.convnet.layer2, self.convnet.layer3]  # Lớp sâu (deep)
-        self.layers['L4'] = [self.convnet.layer4, self.fc]  # Lớp output (layer4 + fc)
-        print("Mạng đã được chia thành L1, L2, L3, L4.")
-
-    def get_layer_weights(self, layer_num):
-        """
-        Truy xuất trọng số của lớp thứ layer_num (1: L1, 2: L2, 3: L3, 4: L4).
-        Trả về tensor trọng số (weights) flatten.
-        """
-        if layer_num < 1 or layer_num > 4:
-            raise ValueError("Layer phải từ 1 đến 4")
-        layer_key = f'L{layer_num}'
-        if not hasattr(self, 'layers') or layer_key not in self.layers:
-            self.split_layers()  # Chia nếu chưa có
-        layer_modules = self.layers[layer_key]
-        weights = []
-        for module in layer_modules:
-            for name, param in module.named_parameters():
-                if 'weight' in name:  # Chỉ lấy weights, bỏ bias
-                    weights.append(param.data)
-        if not weights:
-            raise ValueError(f"Không tìm thấy trọng số ở lớp {layer_num}")
-        return torch.cat([w.view(-1) for w in weights])  # Flatten để dễ xử lý
-
-    def set_layer_weights(self, layer_num, new_weights):
-        """
-        Cập nhật trọng số của lớp thứ layer_num từ new_weights.
-        new_weights phải là tensor flatten, sẽ reshape lại để khớp với param gốc.
-        """
-        if layer_num < 1 or layer_num > 4:
-            raise ValueError("Layer phải từ 1 đến 4")
-        layer_key = f'L{layer_num}'
-        if not hasattr(self, 'layers') or layer_key not in self.layers:
-            self.split_layers()
-        layer_modules = self.layers[layer_key]
-        idx = 0
-        for module in layer_modules:
-            for name, param in module.named_parameters():
-                if 'weight' in name:
-                    param_size = param.numel()
-                    param.data = new_weights[idx:idx + param_size].view_as(param)
-                    idx += param_size
-        if idx != new_weights.numel():
-            raise ValueError("Kích thước new_weights không khớp")
-        print(f"Trọng số lớp {layer_num} đã được cập nhật.")
 
 
 class BiasLayer(nn.Module):
