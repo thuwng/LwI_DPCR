@@ -279,8 +279,9 @@ class LwI(BaseLearner):
                     block_sim = block_old.dot(W_new_np.T)
                     R_memmap[start:end, :] = block_sim.astype('float32')
                     R_memmap.flush()
+                    del block_old, block_sim  # Xóa ngay sau khi ghi
+                    safe_cuda_empty()  # Giải phóng bộ nhớ GPU (nếu có)
                     logging.info(f"[DEBUG] [Similarity] Batch {start}:{end} computed and written to memmap")
-                    del block_old, block_sim
                 except MemoryError as me:
                     logging.error(f"[ERROR] [Similarity] MemoryError in batch {start}:{end}: {str(me)}")
                     logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
@@ -303,7 +304,7 @@ class LwI(BaseLearner):
                     os.remove(R_memmap.filename)
                 except Exception as e:
                     logging.warning(f"[DEBUG] [Similarity] Failed to remove memmap file {R_memmap.filename}: {str(e)}")
-            del W_old_norm, W_new_norm
+            del R_memmap, W_old_norm, W_new_norm
             safe_cuda_empty()
             logging.info("[DEBUG] [Similarity] Cleared memory after _compute_similarity")
 
@@ -380,7 +381,7 @@ class LwI(BaseLearner):
             R = None
             try:
                 logging.info(f"[DEBUG] [Fuse] Starting similarity computation for layer {layer}")
-                R = self._compute_similarity(W_old_2d, W_new_2d, batch_size=512, use_cpu=True)
+                R = self._compute_similarity(W_old_2d, W_new_2d, batch_size=128, use_cpu=True)
                 logging.info(f"[DEBUG] [Fuse] Similarity matrix R computed for layer {layer}, shape={R.shape}")
 
                 logging.info(f"[DEBUG] [Fuse] Computing permutation matrix for layer {layer}")
@@ -838,7 +839,7 @@ class LwI(BaseLearner):
         """
         Build protos/covs/projectors per class và giữ trên CPU (tiết kiệm VRAM).
         """
-        bs_local = min(64, self.args.get("batch_size", batch_size))
+        bs_local = min(32, self.args.get("batch_size", batch_size))
         for class_idx in range(self._known_classes, self._total_classes):
             data, targets, idx_dataset = self.data_manager.get_dataset(
                 np.arange(class_idx, class_idx + 1),
@@ -901,6 +902,7 @@ class LwI(BaseLearner):
 
     # ---------------- epoch loops ----------------
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
+        scaler = GradScaler(enabled=self._amp_enabled and torch.cuda.is_available())
         prog_bar = tqdm(range(init_epoch))
         for _, epoch in enumerate(prog_bar):
             self._network.train()
@@ -908,27 +910,18 @@ class LwI(BaseLearner):
             correct, total = 0, 0
             for _, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device, non_blocking=True), targets.to(self._device, non_blocking=True)
-                if self._amp_enabled and torch.cuda.is_available():
-                    with torch.amp.autocast(device_type="cuda", dtype=self._amp_dtype):
-                        logits = self._network(inputs)["logits"]
-                        loss = F.cross_entropy(logits, targets)
-                else:
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast(device_type="cuda", dtype=self._amp_dtype, enabled=self._amp_enabled):
                     logits = self._network(inputs)["logits"]
                     loss = F.cross_entropy(logits, targets)
-
-                optimizer.zero_grad(set_to_none=True)
-                if self._amp_enabled:
-                    loss.backward()
-                else:
-                    loss.backward()
-                optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 losses += loss.item()
-
                 with torch.no_grad():
                     _, preds = torch.max(logits, dim=1)
                     correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                     total += len(targets)
-
                 del logits, preds, inputs, targets
                 safe_cuda_empty()
 
@@ -945,6 +938,7 @@ class LwI(BaseLearner):
         logging.info(info)
 
     def _update_representation(self, train_loader, test_loader, optimizer, scheduler):
+        scaler = GradScaler(enabled=self._amp_enabled and torch.cuda.is_available())
         prog_bar = tqdm(range(epochs))
         for _, epoch in enumerate(prog_bar):
             self._network.train()
@@ -952,61 +946,45 @@ class LwI(BaseLearner):
             correct, total = 0, 0
             for _, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device, non_blocking=True), targets.to(self._device, non_blocking=True)
-
-                if self._amp_enabled and torch.cuda.is_available():
-                    with torch.amp.autocast(device_type="cuda", dtype=self._amp_dtype):
-                        outputs = self._network(inputs)
-                        logits = outputs["logits"]
-                else:
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast(device_type="cuda", dtype=self._amp_dtype, enabled=self._amp_enabled):
                     outputs = self._network(inputs)
                     logits = outputs["logits"]
-
-                fake_targets = targets - self._known_classes
-                loss_clf = F.cross_entropy(logits[:, self._known_classes:], fake_targets)
-
-                loss_kd = torch.tensor(0.0, device=self._device, dtype=torch.float32)
-                loss_ot = torch.tensor(0.0, device=self._device, dtype=torch.float32)
-
-                if self._old_network is not None:
-                    # compute old_logits on CPU, rồi đưa sang GPU cho KD
-                    inputs_cpu = inputs.detach().cpu()
-                    with torch.inference_mode():
-                        old_logits_cpu = self._old_network(inputs_cpu)["logits"].detach().cpu()
-                    old_logits_gpu = old_logits_cpu.to(self._device, non_blocking=True)
-                    loss_kd = _KD_loss(logits[:, :self._known_classes], old_logits_gpu, T)
-                    del old_logits_cpu, old_logits_gpu
-                    safe_cuda_empty()
-
-                    # optional OT alignment (cẩn thận bộ nhớ)
-                    if self.do_ot_alignment:
-                        try:
-                            from utils.ot_align import get_wassersteinized_layers_modularized  # nếu có
-                            aligned_layers, _ = get_wassersteinized_layers_modularized(self.args, self._device,
-                                                                                       [self._old_network, self._network])
-                            for old_param, new_like in zip(self._old_network.parameters(), aligned_layers):
-                                if old_param.shape == new_like.shape:
-                                    loss_ot += F.mse_loss(old_param.to(self._device, non_blocking=True), new_like)
-                            del aligned_layers
-                        except Exception as e:
-                            logging.warning(f"[OT] skipped due to: {e}")
-                            if self.debug_mode:
-                                traceback.print_exc()
-
-                loss = lamda * loss_kd + loss_clf + 0.1 * loss_ot
-
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                    fake_targets = targets - self._known_classes
+                    loss_clf = F.cross_entropy(logits[:, self._known_classes:], fake_targets)
+                    loss_kd = torch.tensor(0.0, device=self._device, dtype=torch.float32)
+                    loss_ot = torch.tensor(0.0, device=self._device, dtype=torch.float32)
+                    if self._old_network is not None:
+                        inputs_cpu = inputs.detach().cpu()
+                        with torch.inference_mode():
+                            old_logits_cpu = self._old_network(inputs_cpu)["logits"].detach().cpu()
+                        old_logits_gpu = old_logits_cpu.to(self._device, non_blocking=True)
+                        loss_kd = _KD_loss(logits[:, :self._known_classes], old_logits_gpu, T)
+                        del old_logits_cpu, old_logits_gpu
+                        safe_cuda_empty()
+                        if self.do_ot_alignment and epoch % 10 == 0:
+                            try:
+                                from utils.ot_align import get_wassersteinized_layers_modularized
+                                aligned_layers, _ = get_wassersteinized_layers_modularized(self.args, self._device,
+                                                                                        [self._old_network, self._network])
+                                for old_param, new_like in zip(self._old_network.parameters(), aligned_layers):
+                                    if old_param.shape == new_like.shape:
+                                        loss_ot += F.mse_loss(old_param.to(self._device, non_blocking=True), new_like)
+                                del aligned_layers
+                                safe_cuda_empty()
+                            except Exception as e:
+                                logging.warning(f"[OT] skipped due to: {e}")
+                    loss = lamda * loss_kd + loss_clf + 0.1 * loss_ot
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 losses += loss.item()
-
                 with torch.no_grad():
                     _, preds = torch.max(logits, dim=1)
                     correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                     total += len(targets)
-
                 del outputs, logits, preds, inputs, targets
                 safe_cuda_empty()
-
             scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
             if epoch % 25 == 0:
