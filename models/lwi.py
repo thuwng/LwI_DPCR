@@ -124,12 +124,14 @@ class LwI(BaseLearner):
 
     # ---------------- lifecycle ----------------
     def after_task(self):
+        logging.info("[DEBUG] Starting after_task")
         # copy old network and keep it on CPU to save VRAM
         self._old_network = self._network.copy().freeze()
         try:
             self._old_network.to(self._cpu)
-        except Exception:
-            pass
+            logging.info("[DEBUG] Moved old_network to CPU")
+        except Exception as e:
+            logging.warning(f"[DEBUG] Failed to move old_network to CPU: {str(e)}")
 
         # free GPU cache
         safe_cuda_empty()
@@ -137,15 +139,30 @@ class LwI(BaseLearner):
         self._known_classes = self._total_classes
         if not self.args.get('resume', False):
             if not os.path.exists(self.args["model_dir"]):
+                logging.info(f"[DEBUG] Creating model directory: {self.args['model_dir']}")
                 os.makedirs(self.args["model_dir"])
-            # fuse weights (on CPU)
             if self.debug_mode:
                 print_mem("before _fuse_weights in after_task")
-            self._fuse_weights()
+            logging.info("[DEBUG] Calling _fuse_weights")
+            try:
+                self._fuse_weights()
+                logging.info("[DEBUG] _fuse_weights completed")
+            except Exception as e:
+                logging.error(f"[ERROR] Failed in _fuse_weights: {str(e)}")
+                logging.error(f"[ERROR] Traceback: {traceback.format_exc()}")
+                raise
             if self.debug_mode:
                 print_mem("after _fuse_weights in after_task")
-            self.save_checkpoint("{}".format(self.args["model_dir"]))
+            logging.info("[DEBUG] Saving checkpoint")
+            try:
+                self.save_checkpoint("{}".format(self.args["model_dir"]))
+                logging.info("[DEBUG] Checkpoint saved")
+            except Exception as e:
+                logging.error(f"[ERROR] Failed to save checkpoint: {str(e)}")
+                logging.error(f"[ERROR] Traceback: {traceback.format_exc()}")
+                raise
         safe_cuda_empty()
+        logging.info("[DEBUG] after_task completed")
 
     # ---------------- weight similarity (CPU, blockwise) ----------------
     @torch.no_grad()
@@ -221,91 +238,118 @@ class LwI(BaseLearner):
     @torch.no_grad()
     def _fuse_weights(self):
         if self._old_network is None or self._network is None:
-            logging.info("[Fuse] Skipping _fuse_weights: old_network or network is None")
+            logging.info("[DEBUG] [Fuse] Skipping _fuse_weights: old_network or network is None")
             return
 
         HUNGARIAN_MAX = self.args.get("hungarian_max", 3000)
         prev_P = None  # align chuỗi convs
 
         for layer in range(2, 5):
+            logging.info(f"[DEBUG] [Fuse] Processing layer {layer}")
             W_old = self._old_network.get_layer_weights(layer)
             W_new = self._network.get_layer_weights(layer)
 
             if W_old is None or W_new is None:
-                logging.warning(f"[Fuse] Skipping layer {layer}: W_old or W_new is None")
+                logging.warning(f"[DEBUG] [Fuse] Skipping layer {layer}: W_old or W_new is None")
                 continue
 
             is_deep = (layer >= 4)
 
             # Chuyển ma trận sang CPU
-            W_old = W_old.detach().float().to(self._cpu)
-            W_new = W_new.detach().float().to(self._cpu)
+            logging.info(f"[DEBUG] [Fuse] Moving weights to CPU for layer {layer}")
+            try:
+                W_old = W_old.detach().float().to(self._cpu)
+                W_new = W_new.detach().float().to(self._cpu)
+                logging.info(f"[DEBUG] [Fuse] Weights moved to CPU for layer {layer}")
+            except Exception as e:
+                logging.error(f"[ERROR] [Fuse] Failed to move weights to CPU for layer {layer}: {str(e)}")
+                logging.error(f"[ERROR] [Fuse] Traceback: {traceback.format_exc()}")
+                raise
 
-            orig_shape_old = W_old.shape  # e.g., (out, in, h, w) for conv
+            orig_shape_old = W_old.shape
             if prev_P is not None and len(orig_shape_old) == 4:
-                # Reshape to (out, in, h*w) và align input bằng prev_P.T
-                nout, nin, h, w = orig_shape_old
-                W_old_resh = W_old.view(nout, nin, -1)
-                # prev_P có shape (old_prev_out, new_prev_out); cần align input (nin) theo output prev layer
-                # an toàn: nếu kích thước không khớp, bỏ qua
-                if prev_P.shape[0] == nin:
-                    W_old_resh_aligned = torch.einsum('oik, ij -> ojk', W_old_resh, prev_P)  # (nout, nin_new, k)
-                    W_old = W_old_resh_aligned.view(nout, prev_P.shape[1], h, w)
+                logging.info(f"[DEBUG] [Fuse] Aligning input channels with prev_P for layer {layer}")
+                try:
+                    nout, nin, h, w = orig_shape_old
+                    W_old_resh = W_old.view(nout, nin, -1)
+                    if prev_P.shape[0] == nin:
+                        W_old_resh_aligned = torch.einsum('oik, ij -> ojk', W_old_resh, prev_P)
+                        W_old = W_old_resh_aligned.view(nout, prev_P.shape[1], h, w)
+                        logging.info(f"[DEBUG] [Fuse] Input channels aligned for layer {layer}")
+                    else:
+                        logging.warning(f"[DEBUG] [Fuse] Skipping alignment for layer {layer}: prev_P shape {prev_P.shape} mismatch with nin {nin}")
+                except Exception as e:
+                    logging.error(f"[ERROR] [Fuse] Failed to align input channels for layer {layer}: {str(e)}")
+                    logging.error(f"[ERROR] [Fuse] Traceback: {traceback.format_exc()}")
+                    raise
 
-            W_old_2d, shape_old = self._flatten_out_first(W_old)
-            W_new_2d, shape_new = self._flatten_out_first(W_new)
+            logging.info(f"[DEBUG] [Fuse] Flattening weights for layer {layer}")
+            try:
+                W_old_2d, shape_old = self._flatten_out_first(W_old)
+                W_new_2d, shape_new = self._flatten_out_first(W_new)
+                logging.info(f"[DEBUG] [Fuse] Weights flattened: W_old_2d.shape={W_old_2d.shape}, W_new_2d.shape={W_new_2d.shape}")
+            except Exception as e:
+                logging.error(f"[ERROR] [Fuse] Failed to flatten weights for layer {layer}: {str(e)}")
+                logging.error(f"[ERROR] [Fuse] Traceback: {traceback.format_exc()}")
+                raise
 
             n_out_old, feat_old = W_old_2d.shape
             n_out_new, feat_new = W_new_2d.shape
 
             if feat_old != feat_new:
-                logging.warning(f"[Fuse] Skip layer {layer}: feature dim mismatch old({feat_old}) vs new({feat_new})")
+                logging.warning(f"[DEBUG] [Fuse] Skipping layer {layer}: feature dim mismatch old({feat_old}) vs new({feat_new})")
                 continue
 
             if self.debug_mode:
                 print_mem(f"fuse_weights layer {layer} - before similarity")
-                logging.info(f"[Fuse] Layer {layer} shapes: W_old_2d={W_old_2d.shape}, W_new_2d={W_new_2d.shape}")
 
             self._last_fuse_layer = layer
             R = None
             try:
-                # Tính ma trận tương tự
-                logging.info(f"[Fuse] Starting similarity computation for layer {layer}")
+                logging.info(f"[DEBUG] [Fuse] Starting similarity computation for layer {layer}")
                 R = self._compute_similarity(W_old_2d, W_new_2d, batch_size=512, use_cpu=True)
+                logging.info(f"[DEBUG] [Fuse] Similarity matrix R computed for layer {layer}, shape={R.shape}")
 
-                # Tính P (CPU, memory-safe)
+                logging.info(f"[DEBUG] [Fuse] Computing permutation matrix for layer {layer}")
                 P = self._compute_permutation_matrix(R, layer, is_deep=is_deep)
+                logging.info(f"[DEBUG] [Fuse] Permutation matrix P computed for layer {layer}, shape={P.shape}")
 
-                # P_left dùng để nhân bên trái (align hàng/out_channels)
                 P_left = P.t().contiguous().to(dtype=torch.float32, device=self._cpu)
                 if P_left.shape != (n_out_new, n_out_old):
-                    logging.error(f"[Fuse] P_left shape invalid: {P_left.shape}, expected {(n_out_new, n_out_old)}")
+                    logging.error(f"[ERROR] [Fuse] P_left shape invalid for layer {layer}: {P_left.shape}, expected {(n_out_new, n_out_old)}")
                     raise ValueError(f"P_left shape invalid: {P_left.shape}, expected {(n_out_new, n_out_old)}")
+                logging.info(f"[DEBUG] [Fuse] P_left computed for layer {layer}, shape={P_left.shape}")
 
-                # Fused = align(old) hoặc blend(old,new)
-                logging.info(f"[Fuse] Computing fused weights for layer {layer}")
+                logging.info(f"[DEBUG] [Fuse] Computing fused weights for layer {layer}")
                 aligned_old = torch.matmul(P_left, W_old_2d)
                 if layer == 2:
                     W_fused_2d = aligned_old
                 else:
                     W_fused_2d = k * aligned_old + (1 - k) * W_new_2d
+                logging.info(f"[DEBUG] [Fuse] Fused weights computed for layer {layer}")
 
                 W_fused = W_fused_2d.view(*shape_new).to(self._cpu)
                 self._old_network.set_layer_weights(layer, W_fused)
-                prev_P = P  # lưu để align conv kế tiếp
-
+                logging.info(f"[DEBUG] [Fuse] Set fused weights for layer {layer}")
+                prev_P = P
+            except Exception as e:
+                logging.error(f"[ERROR] [Fuse] Failed during weight fusion for layer {layer}: {str(e)}")
+                logging.error(f"[ERROR] [Fuse] Traceback: {traceback.format_exc()}")
+                raise
             finally:
-                # Dọn dẹp tệp memmap
                 if R is not None and hasattr(R, 'filename'):
                     try:
                         if os.path.exists(R.filename):
                             file_size = os.path.getsize(R.filename) / (1024 ** 3)
-                            logging.info(f"[Fuse] Removing memmap file: {R.filename}, size={file_size:.2f} GB")
+                            logging.info(f"[DEBUG] [Fuse] Removing memmap file: {R.filename}, size={file_size:.2f} GB")
                             os.remove(R.filename)
+                        else:
+                            logging.info(f"[DEBUG] [Fuse] Memmap file {R.filename} does not exist")
                     except Exception as e:
-                        logging.warning(f"[Fuse] Failed to remove memmap file {getattr(R,'filename','?')}: {e}")
+                        logging.warning(f"[DEBUG] [Fuse] Failed to remove memmap file {getattr(R,'filename','?')}: {str(e)}")
                 del R
                 safe_cuda_empty()
+                logging.info(f"[DEBUG] [Fuse] Cleared memory after processing layer {layer}")
 
             if self.debug_mode:
                 print_mem(f"fuse_weights layer {layer} - after processing")
@@ -313,7 +357,7 @@ class LwI(BaseLearner):
         if self.debug_mode:
             print_mem("after _fuse_weights")
             disk_usage = psutil.disk_usage('/kaggle/working' if os.path.exists('/kaggle/working') else '/tmp')
-            logging.info(f"[Fuse] Final disk usage: Free={disk_usage.free / (1024 ** 3):.2f} GB, Total={disk_usage.total / (1024 ** 3):.2f} GB")
+            logging.info(f"[DEBUG] [Fuse] Final disk usage: Free={disk_usage.free / (1024 ** 3):.2f} GB, Total={disk_usage.total / (1024 ** 3):.2f} GB")
 
     def _flatten_out_first(self, W):
         if W.dim() == 2:
@@ -336,13 +380,9 @@ class LwI(BaseLearner):
             pass
 
     def _approx_permutation_from_memmap(self, R, layer):
-        """
-        Approximate a one-to-one matching from similarity memmap R (n_old x n_new).
-        - Tìm argmax theo cột (đọc theo block hàng), sau đó tham lam đảm bảo 1-1.
-        - Không bao giờ nạp toàn bộ R vào RAM.
-        """
         import numpy as _np
 
+        logging.info(f"[DEBUG] [ApproxPerm] Starting _approx_permutation_from_memmap for layer {layer}")
         n_old, n_new = R.shape
         best_vals = -1e9 * _np.ones((n_new,), dtype='float32')
         best_idxs = -1 * _np.ones((n_new,), dtype='int64')
@@ -350,82 +390,106 @@ class LwI(BaseLearner):
         BLOCK = 1024
         for start in range(0, n_old, BLOCK):
             end = min(start + BLOCK, n_old)
-            block = R[start:end, :]  # (block_size, n_new)
-            block_max = block.max(axis=0)
-            block_arg = block.argmax(axis=0)
+            logging.info(f"[DEBUG] [ApproxPerm] Processing batch {start}:{end} of {n_old} for layer {layer}")
+            try:
+                block = R[start:end, :]  # (block_size, n_new)
+                block_max = block.max(axis=0)
+                block_arg = block.argmax(axis=0)
 
-            mask = block_max > best_vals
-            if mask.any():
-                best_vals[mask] = block_max[mask]
-                best_idxs[mask] = (start + block_arg[mask])
+                mask = block_max > best_vals
+                if mask.any():
+                    best_vals[mask] = block_max[mask]
+                    best_idxs[mask] = (start + block_arg[mask])
+                logging.info(f"[DEBUG] [ApproxPerm] Batch {start}:{end} processed for layer {layer}")
+            except Exception as e:
+                logging.error(f"[ERROR] [ApproxPerm] Failed to process batch {start}:{end} for layer {layer}: {str(e)}")
+                logging.error(f"[ERROR] [ApproxPerm] Traceback: {traceback.format_exc()}")
+                raise
 
-        # form candidate list (val, new_idx, old_idx)
-        candidates = []
-        for new_idx in range(n_new):
-            old_idx = int(best_idxs[new_idx])
-            val = float(best_vals[new_idx])
-            if old_idx >= 0:
-                candidates.append((val, new_idx, old_idx))
+        logging.info(f"[DEBUG] [ApproxPerm] Forming candidate list for layer {layer}")
+        try:
+            candidates = []
+            for new_idx in range(n_new):
+                old_idx = int(best_idxs[new_idx])
+                val = float(best_vals[new_idx])
+                if old_idx >= 0:
+                    candidates.append((val, new_idx, old_idx))
 
-        candidates.sort(reverse=True, key=lambda x: x[0])
+            candidates.sort(reverse=True, key=lambda x: x[0])
 
-        assigned_old = set()
-        assigned_new = set()
-        pairs = []
-        for val, new_idx, old_idx in candidates:
-            if old_idx in assigned_old or new_idx in assigned_new:
-                continue
-            assigned_old.add(old_idx)
-            assigned_new.add(new_idx)
-            pairs.append((old_idx, new_idx))
-            if len(assigned_old) >= min(n_old, n_new):
-                break
+            assigned_old = set()
+            assigned_new = set()
+            pairs = []
+            for val, new_idx, old_idx in candidates:
+                if old_idx in assigned_old or new_idx in assigned_new:
+                    continue
+                assigned_old.add(old_idx)
+                assigned_new.add(new_idx)
+                pairs.append((old_idx, new_idx))
+                if len(assigned_old) >= min(n_old, n_new):
+                    break
 
-        P = torch.zeros((n_old, n_new), device=self._cpu, dtype=torch.float32)
-        for old_idx, new_idx in pairs:
-            if 0 <= old_idx < n_old and 0 <= new_idx < n_new:
-                P[old_idx, new_idx] = 1.0
-        return P
+            P = torch.zeros((n_old, n_new), device=self._cpu, dtype=torch.float32)
+            for old_idx, new_idx in pairs:
+                if 0 <= old_idx < n_old and 0 <= new_idx < n_new:
+                    P[old_idx, new_idx] = 1.0
+            logging.info(f"[DEBUG] [ApproxPerm] Permutation matrix formed for layer {layer}, P shape={P.shape}")
+            return P
+        except Exception as e:
+            logging.error(f"[ERROR] [ApproxPerm] Failed to form permutation matrix for layer {layer}: {str(e)}")
+            logging.error(f"[ERROR] [ApproxPerm] Traceback: {traceback.format_exc()}")
+            raise
 
     def _compute_permutation_matrix(self, R, layer, is_deep=False):
-        """
-        Trả về P kích thước (n_old, n_new).
-        R: numpy.memmap | numpy.ndarray | torch.Tensor (CPU).
-        Nhỏ (<= hungarian_max): Hungarian với cost = -R (maximize similarity).
-        Lớn: xấp xỉ tham lam theo cột (không load hết).
-        """
         import numpy as _np
 
+        logging.info(f"[DEBUG] [Permutation] Starting _compute_permutation_matrix for layer {layer}")
         # Lấy kích thước không ép copy
-        if isinstance(R, (_np.memmap, _np.ndarray)):
-            n_old, n_new = R.shape
-        elif torch.is_tensor(R):
-            n_old, n_new = R.shape
-            R = R.cpu().numpy()
-        else:
-            raise ValueError(f"Unsupported R type: {type(R)}")
+        try:
+            if isinstance(R, (_np.memmap, _np.ndarray)):
+                n_old, n_new = R.shape
+            elif torch.is_tensor(R):
+                n_old, n_new = R.shape
+                R = R.cpu().numpy()
+            else:
+                logging.error(f"[ERROR] [Permutation] Unsupported R type: {type(R)}")
+                raise ValueError(f"Unsupported R type: {type(R)}")
+            logging.info(f"[DEBUG] [Permutation] R shape: ({n_old}, {n_new})")
+        except Exception as e:
+            logging.error(f"[ERROR] [Permutation] Failed to get R shape: {str(e)}")
+            logging.error(f"[ERROR] [Permutation] Traceback: {traceback.format_exc()}")
+            raise
 
         if n_old == 0 or n_new == 0:
+            logging.error(f"[ERROR] [Permutation] Input R invalid: ({n_old}, {n_new})")
             raise ValueError(f"Input R invalid: {(n_old, n_new)}")
 
         HUNGARIAN_MAX = self.args.get("hungarian_max", 3000)
 
         if min(n_old, n_new) <= HUNGARIAN_MAX:
-            # Hungarian cần mảng dense; memmap ok với kích thước nhỏ
+            logging.info(f"[DEBUG] [Permutation] Using Hungarian algorithm for layer {layer}")
             try:
-                # maximize similarity => minimize -R
                 cost = -R
                 row_ind, col_ind = linear_sum_assignment(cost)
                 P = torch.zeros((n_old, n_new), device=self._cpu, dtype=torch.float32)
                 P[row_ind, col_ind] = 1.0
+                logging.info(f"[DEBUG] [Permutation] Hungarian completed for layer {layer}, P shape={P.shape}")
                 return P
             except Exception as e:
-                logging.warning(f"[Fuse] Hungarian failed at layer {layer} ({n_old}x{n_new}): {e}. Falling back to approx.")
+                logging.warning(f"[ERROR] [Permutation] Hungarian failed at layer {layer} ({n_old}x{n_new}): {str(e)}")
+                logging.warning(f"[ERROR] [Permutation] Traceback: {traceback.format_exc()}")
+                logging.info(f"[DEBUG] [Permutation] Falling back to approx matching for layer {layer}")
 
-        # Lớn: dùng xấp xỉ memory-safe
         if self.debug_mode:
-            logging.warning(f"[Fuse] Using approx matching for layer {layer} ({n_old}x{n_new})")
-        return self._approx_permutation_from_memmap(R, layer)
+            logging.warning(f"[DEBUG] [Permutation] Using approx matching for layer {layer} ({n_old}x{n_new})")
+        try:
+            P = self._approx_permutation_from_memmap(R, layer)
+            logging.info(f"[DEBUG] [Permutation] Approx permutation completed for layer {layer}, P shape={P.shape}")
+            return P
+        except Exception as e:
+            logging.error(f"[ERROR] [Permutation] Failed in approx permutation for layer {layer}: {str(e)}")
+            logging.error(f"[ERROR] [Permutation] Traceback: {traceback.format_exc()}")
+            raise
 
     # ---------------- training ----------------
     def incremental_train(self, data_manager):
