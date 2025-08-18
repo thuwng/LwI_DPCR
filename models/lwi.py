@@ -527,12 +527,13 @@ class LwI(BaseLearner):
                     inputs_cpu = inputs  # dataloader yields CPU tensors
                     inputs_gpu = inputs_cpu.to(self._device, non_blocking=True)
                     # AMP reduce VRAM
-                    if self._amp_enabled:
-                        with torch.cuda.amp.autocast(dtype=self._amp_dtype):
+                    if self._amp_enabled and torch.cuda.is_available():
+                        with torch.amp.autocast("cuda", dtype=self._amp_dtype):
                             out_backbone = self._network(inputs_gpu)["features"]
                     else:
                         out_backbone = self._network(inputs_gpu)["features"]
 
+                    out_backbone = out_backbone.to(torch.float32)
                     out_fe, _ = self.al_classifier(out_backbone)
                     out_fe_cpu = out_fe.detach().cpu()
                     label_onehot = F.one_hot(targets, self._total_classes).float()
@@ -598,8 +599,8 @@ class LwI(BaseLearner):
                     for _, (_, inputs, targets) in enumerate(tqdm(self.train_loader, desc='DPCR accumulation', unit='batch')):
                         inputs_cpu = inputs
                         inputs_gpu = inputs_cpu.to(self._device, non_blocking=True)
-                        if self._amp_enabled:
-                            with torch.cuda.amp.autocast(dtype=self._amp_dtype):
+                        if self._amp_enabled and torch.cuda.is_available():
+                            with torch.cuda.amp.autocast("cuda", dtype=self._amp_dtype):
                                 feats_new_gpu = self._network(inputs_gpu)["features"]
                         else:
                             feats_new_gpu = self._network(inputs_gpu)["features"]
@@ -707,8 +708,8 @@ class LwI(BaseLearner):
                 for _, (_, inputs, _) in enumerate(idx_loader):
                     inputs_cpu = inputs
                     inputs_gpu = inputs_cpu.to(self._device, non_blocking=True)
-                    if self._amp_enabled:
-                        with torch.cuda.amp.autocast(dtype=self._amp_dtype):
+                    if self._amp_enabled and torch.cuda.is_available():
+                        with torch.cuda.amp.autocast("cuda", dtype=self._amp_dtype):
                             feats_gpu = self._network(inputs_gpu)["features"]
                     else:
                         feats_gpu = self._network(inputs_gpu)["features"]
