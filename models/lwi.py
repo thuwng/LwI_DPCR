@@ -2,6 +2,7 @@ import logging
 import numpy as np
 import torch
 import os
+import psutil
 from torch import nn
 from tqdm import tqdm
 from torch import optim
@@ -76,6 +77,10 @@ class LwI(BaseLearner):
         self._device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self._cpu = torch.device("cpu")
 
+        # AMP dtype
+        self._amp_enabled = bool(args.get("amp", True) and torch.cuda.is_available())
+        self._amp_dtype = torch.float16 if torch.cuda.is_available() else torch.bfloat16
+
         # hyper
         self.tau = args.get("tau", 0.1)
         self.E = args.get("E", 1000)
@@ -142,68 +147,51 @@ class LwI(BaseLearner):
             self.save_checkpoint("{}".format(self.args["model_dir"]))
         safe_cuda_empty()
 
-    # ---------------- weight fusion ----------------
+    # ---------------- weight similarity (CPU, blockwise) ----------------
     @torch.no_grad()
     def _compute_similarity(self, W_old, W_new, batch_size=512, use_cpu=True):
         import numpy as _np
         import os
-        import psutil
 
         # Đảm bảo ma trận trên CPU và contiguous
         W_old_2d = W_old.view(W_old.size(0), -1).float().cpu().contiguous()
         W_new_2d = W_new.view(W_new.size(0), -1).float().cpu().contiguous()
-        
+
         # Ghi log thông tin layer
         layer_debug = getattr(self, "_last_fuse_layer", None)
         if layer_debug is not None:
             self._log_layer_info(layer_debug, W_old_2d, W_new_2d)
-        
+
         # Chuẩn hóa ma trận
         W_old_norm = F.normalize(W_old_2d, p=2, dim=1)
         W_new_norm = F.normalize(W_new_2d, p=2, dim=1)
-        
+
         n_old, n_new = W_old_norm.size(0), W_new_norm.size(0)
         if self.debug_mode:
-            # Log kích thước ma trận và ước tính kích thước memmap
-            matrix_size_bytes = n_old * n_new * 4  # float32 = 4 bytes
+            matrix_size_bytes = n_old * n_new * 4
             matrix_size_gb = matrix_size_bytes / (1024 ** 3)
-            logging.info(f"[Similarity] n_old={n_old}, n_new={n_new}, R_shape={(n_old, n_new)}, "
-                        f"Estimated R size: {matrix_size_gb:.2f} GB")
-            
-            # Log dung lượng đĩa trống
-            disk_usage = psutil.disk_usage('/kaggle/working')
-            logging.info(f"[Disk] Free space in /kaggle/working: {disk_usage.free / (1024 ** 3):.2f} GB, "
-                        f"Total: {disk_usage.total / (1024 ** 3):.2f} GB")
-        
+            logging.info(f"[Similarity] n_old={n_old}, n_new={n_new}, R_shape={(n_old, n_new)}, Estimated R size: {matrix_size_gb:.2f} GB")
+            disk_usage = psutil.disk_usage('/kaggle/working' if os.path.exists('/kaggle/working') else '/tmp')
+            logging.info(f"[Disk] Free space: {disk_usage.free / (1024 ** 3):.2f} GB, Total: {disk_usage.total / (1024 ** 3):.2f} GB")
+
         # Nếu ma trận nhỏ, tính trực tiếp trong RAM để tránh I/O
         if min(n_old, n_new) < 10:
             logging.info("[Similarity] Small matrix detected, computing directly in RAM")
             R = W_old_norm @ W_new_norm.t()
-            if self.debug_mode:
-                logging.info(f"[Similarity] Computed R in RAM, shape={R.shape}, "
-                            f"memory usage: {psutil.virtual_memory().used / (1024 ** 3):.2f} GB")
             return R.cpu().numpy()
-        
-        # Sử dụng /kaggle/working thay vì /tmp
-        tmpdir = "/kaggle/working"
+
+        # Sử dụng /kaggle/working nếu có, ngược lại /tmp
+        tmpdir = "/kaggle/working" if os.path.exists("/kaggle/working") else "/tmp"
         if not os.path.exists(tmpdir):
-            os.makedirs(tmpdir)
+            os.makedirs(tmpdir, exist_ok=True)
         fname = os.path.join(tmpdir, f"similarity_R_{os.getpid()}_{int(torch.randint(0, int(1e9), (1,)).item())}.dat")
-        
+
+        R_memmap = None
         try:
-            # Log trước khi tạo memmap
             if self.debug_mode:
                 logging.info(f"[Similarity] Creating memmap file: {fname}")
-            
-            # Tạo memmap
             R_memmap = _np.memmap(fname, dtype='float32', mode='w+', shape=(n_old, n_new))
-            
-            # Log sau khi tạo memmap
-            if self.debug_mode and os.path.exists(fname):
-                file_size = os.path.getsize(fname) / (1024 ** 3)
-                logging.info(f"[Similarity] Memmap file created: {fname}, size={file_size:.2f} GB")
-            
-            # Tính similarity theo batch
+
             W_new_np = W_new_norm.numpy()
             for start in range(0, n_old, batch_size):
                 end = min(start + batch_size, n_old)
@@ -213,117 +201,119 @@ class LwI(BaseLearner):
                 block_sim = block_old.dot(W_new_np.T)
                 R_memmap[start:end, :] = block_sim.astype('float32')
                 R_memmap.flush()
-                if self.debug_mode:
-                    logging.info(f"[Similarity] Batch {start}:{end} written to memmap, "
-                                f"RAM usage: {psutil.virtual_memory().used / (1024 ** 3):.2f} GB")
                 del block_old, block_sim
-            
             return R_memmap
-        
         except Exception as e:
             logging.error(f"[Similarity] Error in _compute_similarity: {e}")
             logging.error(f"[Similarity] Traceback: {traceback.format_exc()}")
+            # nếu fail, cố gắng xoá file
+            try:
+                if R_memmap is not None and hasattr(R_memmap, 'filename') and os.path.exists(R_memmap.filename):
+                    os.remove(R_memmap.filename)
+            except Exception:
+                pass
             raise
         finally:
-            # Dọn dẹp bộ nhớ
-            del W_old_norm, W_new_norm, W_new_np
+            del W_old_norm, W_new_norm
             safe_cuda_empty()
-            if self.debug_mode:
-                logging.info(f"[Similarity] Cleaned up temporary tensors, "
-                            f"RAM usage: {psutil.virtual_memory().used / (1024 ** 3):.2f} GB")
 
+    # ---------------- weight fusion ----------------
+    @torch.no_grad()
     def _fuse_weights(self):
         if self._old_network is None or self._network is None:
             logging.info("[Fuse] Skipping _fuse_weights: old_network or network is None")
             return
-        
+
         HUNGARIAN_MAX = self.args.get("hungarian_max", 3000)
-        
+        prev_P = None  # align chuỗi convs
+
         for layer in range(2, 5):
             W_old = self._old_network.get_layer_weights(layer)
             W_new = self._network.get_layer_weights(layer)
-            
+
             if W_old is None or W_new is None:
                 logging.warning(f"[Fuse] Skipping layer {layer}: W_old or W_new is None")
                 continue
-            
+
+            is_deep = (layer >= 4)
+
             # Chuyển ma trận sang CPU
             W_old = W_old.detach().float().to(self._cpu)
             W_new = W_new.detach().float().to(self._cpu)
-            
+
+            orig_shape_old = W_old.shape  # e.g., (out, in, h, w) for conv
+            if prev_P is not None and len(orig_shape_old) == 4:
+                # Reshape to (out, in, h*w) và align input bằng prev_P.T
+                nout, nin, h, w = orig_shape_old
+                W_old_resh = W_old.view(nout, nin, -1)
+                # prev_P có shape (old_prev_out, new_prev_out); cần align input (nin) theo output prev layer
+                # an toàn: nếu kích thước không khớp, bỏ qua
+                if prev_P.shape[0] == nin:
+                    W_old_resh_aligned = torch.einsum('oik, ij -> ojk', W_old_resh, prev_P)  # (nout, nin_new, k)
+                    W_old = W_old_resh_aligned.view(nout, prev_P.shape[1], h, w)
+
             W_old_2d, shape_old = self._flatten_out_first(W_old)
             W_new_2d, shape_new = self._flatten_out_first(W_new)
-            
+
             n_out_old, feat_old = W_old_2d.shape
             n_out_new, feat_new = W_new_2d.shape
-            
+
             if feat_old != feat_new:
                 logging.warning(f"[Fuse] Skip layer {layer}: feature dim mismatch old({feat_old}) vs new({feat_new})")
                 continue
-            
+
             if self.debug_mode:
                 print_mem(f"fuse_weights layer {layer} - before similarity")
                 logging.info(f"[Fuse] Layer {layer} shapes: W_old_2d={W_old_2d.shape}, W_new_2d={W_new_2d.shape}")
-            
+
             self._last_fuse_layer = layer
             R = None
             try:
                 # Tính ma trận tương tự
                 logging.info(f"[Fuse] Starting similarity computation for layer {layer}")
                 R = self._compute_similarity(W_old_2d, W_new_2d, batch_size=512, use_cpu=True)
-                
-                # Chọn phương pháp tính permutation matrix
-                if hasattr(R, 'shape') and min(R.shape) <= HUNGARIAN_MAX and self.tau < 0.1:
-                    logging.info(f"[Fuse] Using Hungarian algorithm for layer {layer}")
-                    P = self._compute_permutation_matrix(R, layer)
-                else:
-                    if self.debug_mode:
-                        logging.warning(f"[Fuse] Layer {layer} large ({R.shape}), using greedy approx matching")
-                    P = self._approx_permutation_from_memmap(R, layer)
-                
+
+                # Tính P (CPU, memory-safe)
+                P = self._compute_permutation_matrix(R, layer, is_deep=is_deep)
+
+                # P_left dùng để nhân bên trái (align hàng/out_channels)
                 P_left = P.t().contiguous().to(dtype=torch.float32, device=self._cpu)
-                
                 if P_left.shape != (n_out_new, n_out_old):
                     logging.error(f"[Fuse] P_left shape invalid: {P_left.shape}, expected {(n_out_new, n_out_old)}")
                     raise ValueError(f"P_left shape invalid: {P_left.shape}, expected {(n_out_new, n_out_old)}")
-                
-                # Tính fused weights
+
+                # Fused = align(old) hoặc blend(old,new)
                 logging.info(f"[Fuse] Computing fused weights for layer {layer}")
                 aligned_old = torch.matmul(P_left, W_old_2d)
                 if layer == 2:
                     W_fused_2d = aligned_old
                 else:
                     W_fused_2d = k * aligned_old + (1 - k) * W_new_2d
-                
+
                 W_fused = W_fused_2d.view(*shape_new).to(self._cpu)
                 self._old_network.set_layer_weights(layer, W_fused)
-                if self.debug_mode:
-                    logging.info(f"[Fuse] Layer {layer} weights fused and set, "
-                                f"RAM usage: {psutil.virtual_memory().used / (1024 ** 3):.2f} GB")
-            
+                prev_P = P  # lưu để align conv kế tiếp
+
             finally:
                 # Dọn dẹp tệp memmap
-                if R is not None and hasattr(R, 'filename') and os.path.exists(R.filename):
+                if R is not None and hasattr(R, 'filename'):
                     try:
-                        file_size = os.path.getsize(R.filename) / (1024 ** 3)
-                        logging.info(f"[Fuse] Removing memmap file: {R.filename}, size={file_size:.2f} GB")
-                        os.remove(R.filename)
+                        if os.path.exists(R.filename):
+                            file_size = os.path.getsize(R.filename) / (1024 ** 3)
+                            logging.info(f"[Fuse] Removing memmap file: {R.filename}, size={file_size:.2f} GB")
+                            os.remove(R.filename)
                     except Exception as e:
-                        logging.warning(f"[Fuse] Failed to remove memmap file {R.filename}: {e}")
+                        logging.warning(f"[Fuse] Failed to remove memmap file {getattr(R,'filename','?')}: {e}")
                 del R
                 safe_cuda_empty()
-                if self.debug_mode:
-                    logging.info(f"[Fuse] Cleaned up after layer {layer}, "
-                                f"RAM usage: {psutil.virtual_memory().used / (1024 ** 3):.2f} GB")
-            
+
             if self.debug_mode:
                 print_mem(f"fuse_weights layer {layer} - after processing")
-        
+
         if self.debug_mode:
             print_mem("after _fuse_weights")
-            disk_usage = psutil.disk_usage('/kaggle/working')
-            logging.info(f"[Fuse] Final disk usage: Free={disk_usage.free / (1024 ** 3):.2f} GB, "
-                        f"Total={disk_usage.total / (1024 ** 3):.2f} GB")
+            disk_usage = psutil.disk_usage('/kaggle/working' if os.path.exists('/kaggle/working') else '/tmp')
+            logging.info(f"[Fuse] Final disk usage: Free={disk_usage.free / (1024 ** 3):.2f} GB, Total={disk_usage.total / (1024 ** 3):.2f} GB")
 
     def _flatten_out_first(self, W):
         if W.dim() == 2:
@@ -346,31 +336,24 @@ class LwI(BaseLearner):
             pass
 
     def _approx_permutation_from_memmap(self, R, layer):
-        """Approximate a one-to-one matching from similarity memmap R (n_old x n_new).
-        Strategy:
-        - find best candidate old index for each new column by scanning R in blocks (memory-friendly)
-        - sort candidate pairs by similarity and greedily assign unique old indices
-        - build a sparse permutation matrix P (n_old x n_new) with 1 where assigned
-        This is O(n_old * n_new) in I/O but avoids the O(n^3) Hungarian and huge RAM use.
+        """
+        Approximate a one-to-one matching from similarity memmap R (n_old x n_new).
+        - Tìm argmax theo cột (đọc theo block hàng), sau đó tham lam đảm bảo 1-1.
+        - Không bao giờ nạp toàn bộ R vào RAM.
         """
         import numpy as _np
 
         n_old, n_new = R.shape
-        # best value & index per new column
         best_vals = -1e9 * _np.ones((n_new,), dtype='float32')
         best_idxs = -1 * _np.ones((n_new,), dtype='int64')
 
-        # scan rows in blocks to find argmax per column
         BLOCK = 1024
         for start in range(0, n_old, BLOCK):
             end = min(start + BLOCK, n_old)
-            block = R[start:end, :]  # memmap supports this without loading full file
-            # block shape: (block_size, n_new)
-            # compute max along rows for each column
+            block = R[start:end, :]  # (block_size, n_new)
             block_max = block.max(axis=0)
             block_arg = block.argmax(axis=0)
 
-            # update global bests
             mask = block_max > best_vals
             if mask.any():
                 best_vals[mask] = block_max[mask]
@@ -384,16 +367,13 @@ class LwI(BaseLearner):
             if old_idx >= 0:
                 candidates.append((val, new_idx, old_idx))
 
-        # sort by descending similarity
         candidates.sort(reverse=True, key=lambda x: x[0])
 
         assigned_old = set()
         assigned_new = set()
         pairs = []
         for val, new_idx, old_idx in candidates:
-            if old_idx in assigned_old:
-                continue
-            if new_idx in assigned_new:
+            if old_idx in assigned_old or new_idx in assigned_new:
                 continue
             assigned_old.add(old_idx)
             assigned_new.add(new_idx)
@@ -401,24 +381,23 @@ class LwI(BaseLearner):
             if len(assigned_old) >= min(n_old, n_new):
                 break
 
-        # build sparse P
         P = torch.zeros((n_old, n_new), device=self._cpu, dtype=torch.float32)
         for old_idx, new_idx in pairs:
             if 0 <= old_idx < n_old and 0 <= new_idx < n_new:
                 P[old_idx, new_idx] = 1.0
-
         return P
 
-    def _compute_permutation_matrix(self, R, layer):
+    def _compute_permutation_matrix(self, R, layer, is_deep=False):
         """
         Trả về P kích thước (n_old, n_new).
-        R có thể là torch tensor (CPU) hoăc numpy.ndarray (memmap).
-        Với tau < 0.1 -> Hungarian (khi kích thước chấp nhận được); ngược lại -> Sinkhorn (sử dụng CPU).
+        R: numpy.memmap | numpy.ndarray | torch.Tensor (CPU).
+        Nhỏ (<= hungarian_max): Hungarian với cost = -R (maximize similarity).
+        Lớn: xấp xỉ tham lam theo cột (không load hết).
         """
         import numpy as _np
 
-        # convert shape extraction
-        if isinstance(R, _np.memmap) or isinstance(R, _np.ndarray):
+        # Lấy kích thước không ép copy
+        if isinstance(R, (_np.memmap, _np.ndarray)):
             n_old, n_new = R.shape
         elif torch.is_tensor(R):
             n_old, n_new = R.shape
@@ -429,66 +408,24 @@ class LwI(BaseLearner):
         if n_old == 0 or n_new == 0:
             raise ValueError(f"Input R invalid: {(n_old, n_new)}")
 
-        # safety cap for Hungarian: if too large, raise to let caller decide
         HUNGARIAN_MAX = self.args.get("hungarian_max", 3000)
-        if self.tau < 0.1 and min(n_old, n_new) <= HUNGARIAN_MAX:
-            # Hungarian expects a dense numpy array in memory, but memmap is OK (it provides ndarray interface)
-            cost = -R  # numpy memmap or ndarray
-            row_ind, col_ind = linear_sum_assignment(cost)
-            P = torch.zeros((n_old, n_new), device=torch.device("cpu"), dtype=torch.float32)
-            P[row_ind, col_ind] = 1.0
-            return P
 
-        if self.tau < 0.1 and min(n_old, n_new) > HUNGARIAN_MAX:
-            # caller should have used approx; fallback to approx here
-            if self.debug_mode:
-                logging.warning(f"[Fuse] Hungarian too large for layer {layer} ({n_old}x{n_new}), falling back to approx")
-            return self._approx_permutation_from_memmap(R, layer)
+        if min(n_old, n_new) <= HUNGARIAN_MAX:
+            # Hungarian cần mảng dense; memmap ok với kích thước nhỏ
+            try:
+                # maximize similarity => minimize -R
+                cost = -R
+                row_ind, col_ind = linear_sum_assignment(cost)
+                P = torch.zeros((n_old, n_new), device=self._cpu, dtype=torch.float32)
+                P[row_ind, col_ind] = 1.0
+                return P
+            except Exception as e:
+                logging.warning(f"[Fuse] Hungarian failed at layer {layer} ({n_old}x{n_new}): {e}. Falling back to approx.")
 
-        else:
-            # use numpy -> convert to torch CPU as before for sinkhorn implementation
-            if isinstance(R, _np.ndarray) or isinstance(R, _np.memmap):
-                R_torch = torch.from_numpy(_np.array(R, dtype='float32')).to(torch.device("cpu"))
-            else:
-                # fallback: if R is torch already
-                R_torch = R if torch.is_tensor(R) else torch.from_numpy(_np.array(R)).to(torch.device("cpu"))
-            a = torch.full((n_old,), 1.0 / n_old, dtype=torch.float32, device=torch.device("cpu"))
-            b = torch.full((n_new,), 1.0 / n_new, dtype=torch.float32, device=torch.device("cpu"))
-            M = (-R_torch).to(dtype=torch.float32)
-            P = self.sinkhorn_torch(M=M, a=a, b=b, lambda_sh=1.0, numItermax=1000, stopThr=1e-4, cuda=False)
-            return P
-
-    def sinkhorn_torch(self, M, a, b, lambda_sh, numItermax=1000, stopThr=1e-4, cuda=False):
-        device = self._cpu
-        M = M.to(dtype=torch.float32, device=device)
-        a = a.to(dtype=torch.float32, device=device)
-        b = b.to(dtype=torch.float32, device=device)
-
-        with torch.no_grad():
-            K = torch.exp(-lambda_sh * M).clamp_min(1e-12)
-            u = torch.ones_like(a) / a.size(0)
-            v = torch.ones_like(b) / b.size(0)
-
-            err = float('inf')
-            for it in range(int(numItermax)):
-                Kv = K @ v
-                Kv = Kv.clamp_min(1e-12)
-                u = a / Kv
-
-                KTu = K.t() @ u
-                KTu = KTu.clamp_min(1e-12)
-                v = b / KTu
-
-                if it % 20 == 0:
-                    b_est = v * (K.t() @ u)
-                    err = torch.norm(b_est - b, p=float('inf')).item()
-                    if err < stopThr:
-                        break
-
-            P = (u[:, None] * K) * v[None, :]
-            del K, u, v
-            safe_cuda_empty()
-        return P
+        # Lớn: dùng xấp xỉ memory-safe
+        if self.debug_mode:
+            logging.warning(f"[Fuse] Using approx matching for layer {layer} ({n_old}x{n_new})")
+        return self._approx_permutation_from_memmap(R, layer)
 
     # ---------------- training ----------------
     def incremental_train(self, data_manager):
@@ -544,9 +481,9 @@ class LwI(BaseLearner):
             mode="train",
             shot=self.shot
         )
-        self.train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True, num_workers=nw)
+        self.train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True, num_workers=nw, pin_memory=True)
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
-        self.test_loader = DataLoader(test_dataset, batch_size=bs, shuffle=False, num_workers=nw)
+        self.test_loader = DataLoader(test_dataset, batch_size=bs, shuffle=False, num_workers=nw, pin_memory=True)
 
         # avoid DataParallel if requested
         if not self.no_data_parallel and len(self._multiple_gpus) > 1:
@@ -572,7 +509,7 @@ class LwI(BaseLearner):
                 if not os.path.exists(checkpoint_path):
                     raise FileNotFoundError(f"Checkpoint file {checkpoint_path} not found!")
                 print(f"Loading checkpoint: {checkpoint_path}")
-                self._network.load_state_dict(torch.load(checkpoint_path)["state_dict"], strict=False)
+                self._network.load_state_dict(torch.load(checkpoint_path, map_location=self._device)["state_dict"], strict=False)
 
             if not resume:
                 optimizer = optim.SGD(self._network.parameters(), momentum=0.9, lr=init_lr, weight_decay=init_weight_decay)
@@ -585,17 +522,23 @@ class LwI(BaseLearner):
 
             cov = torch.zeros(self.al_classifier.fe_size, self.al_classifier.fe_size, device=self._cpu)
             crs_cor = torch.zeros(self.al_classifier.fe_size, self._total_classes, device=self._cpu)
-            with torch.no_grad():
+            with torch.inference_mode():
                 for _, (_, inputs, targets) in enumerate(tqdm(train_loader, desc='Analytic Learning Phase=0', unit='batch')):
                     inputs_cpu = inputs  # dataloader yields CPU tensors
-                    inputs_gpu = inputs_cpu.to(self._device)
-                    out_backbone = self._network(inputs_gpu)["features"]
+                    inputs_gpu = inputs_cpu.to(self._device, non_blocking=True)
+                    # AMP reduce VRAM
+                    if self._amp_enabled:
+                        with torch.cuda.amp.autocast(dtype=self._amp_dtype):
+                            out_backbone = self._network(inputs_gpu)["features"]
+                    else:
+                        out_backbone = self._network(inputs_gpu)["features"]
+
                     out_fe, _ = self.al_classifier(out_backbone)
                     out_fe_cpu = out_fe.detach().cpu()
                     label_onehot = F.one_hot(targets, self._total_classes).float()
                     cov += out_fe_cpu.t() @ out_fe_cpu
                     crs_cor += out_fe_cpu.t() @ label_onehot
-                    del out_backbone, out_fe, out_fe_cpu, label_onehot
+                    del out_backbone, out_fe, out_fe_cpu, label_onehot, inputs_gpu
                     safe_cuda_empty()
 
             # keep accumulators on CPU, compute inverse on CPU
@@ -617,7 +560,7 @@ class LwI(BaseLearner):
                 if not os.path.exists(checkpoint_path):
                     raise FileNotFoundError(f"Checkpoint file {checkpoint_path} not found!")
                 print(f"Loading checkpoint: {checkpoint_path}")
-                self._network.load_state_dict(torch.load(checkpoint_path)["state_dict"], strict=False)
+                self._network.load_state_dict(torch.load(checkpoint_path, map_location=self._device)["state_dict"], strict=False)
 
             # network already moved to GPU by incremental_train
             if self._old_network is not None:
@@ -634,36 +577,37 @@ class LwI(BaseLearner):
 
             self._build_protos()
 
-            # DPCR: giữ nguyên logic, nhưng tất cả ma trận tích lũy lớn trên CPU
+            # DPCR
             if self.args.get("DPCR", False):
                 if self.debug_mode:
                     print_mem("before DPCR accumulation")
                 print('Using DPCR')
 
-                # instantiate projector on CPU to avoid holding extra params on GPU
+                # projector trên CPU
                 self.projector = Drift_Estimator(512, False, self.args).to(self._cpu)
                 for _, p in self.projector.named_parameters():
                     p.requires_grad = False
                 self.projector.eval()
 
-                # accumulators on CPU
                 cov_pwdr = (self.projector.rg_tssp * torch.eye(self.projector.fe_size, device=self._cpu)).float()
                 crs_cor_pwdr = torch.zeros(self.projector.fe_size, self.projector.fe_size, device=self._cpu)
                 crs_cor_new = torch.zeros(self.al_classifier.fe_size, self._total_classes, device=self._cpu)
                 cov_new = torch.zeros(self.projector.fe_size, self.projector.fe_size, device=self._cpu)
 
-                # iterate batches: forward new on GPU, old on CPU, move features to CPU and accumulate
-                with torch.no_grad():
+                with torch.inference_mode():
                     for _, (_, inputs, targets) in enumerate(tqdm(self.train_loader, desc='DPCR accumulation', unit='batch')):
-                        inputs_cpu = inputs  # CPU
-                        # new network forward on GPU
-                        inputs_gpu = inputs_cpu.to(self._device)
-                        feats_new_gpu = self._network(inputs_gpu)["features"]
+                        inputs_cpu = inputs
+                        inputs_gpu = inputs_cpu.to(self._device, non_blocking=True)
+                        if self._amp_enabled:
+                            with torch.cuda.amp.autocast(dtype=self._amp_dtype):
+                                feats_new_gpu = self._network(inputs_gpu)["features"]
+                        else:
+                            feats_new_gpu = self._network(inputs_gpu)["features"]
                         feats_new = feats_new_gpu.detach().cpu()
-                        del feats_new_gpu
+                        del feats_new_gpu, inputs_gpu
                         safe_cuda_empty()
 
-                        # old network forward on CPU (old_network stays on CPU), if not present use zeros
+                        # old net trên CPU
                         if self._old_network is not None:
                             feats_old = self._old_network(inputs_cpu)["features"].detach().cpu()
                         else:
@@ -678,15 +622,14 @@ class LwI(BaseLearner):
                         del feats_old, feats_new, label_onehot
                         safe_cuda_empty()
 
-                # now set projector weights using CPU matrices (compute inverse on CPU)
+                # set projector weights (CPU)
                 self.projector.cov = cov_pwdr
                 self.projector.Q = crs_cor_pwdr
                 R_inv = torch.inverse(cov_pwdr)
                 Delta = R_inv @ crs_cor_pwdr
-                # set projector.fc weight on CPU (keep projector on CPU)
                 self.projector.fc.weight = torch.nn.Parameter(Delta.t().float())
 
-                # aggregate primes on CPU and update al_classifier's cov/Q/R (store mostly on CPU)
+                # aggregate primes (CPU)
                 cov_prime = torch.zeros(self.al_classifier.fe_size, self.al_classifier.fe_size, device=self._cpu)
                 Q_prime = torch.zeros(self.al_classifier.fe_size, self.al_classifier.num_classes, device=self._cpu)
 
@@ -694,7 +637,6 @@ class LwI(BaseLearner):
                     if class_idx not in self._projectors or class_idx not in self._covs or class_idx not in self._protos:
                         continue
 
-                    # all stored on CPU
                     W = self.projector.get_weight().cpu() @ self._projectors[class_idx].cpu()
                     cov_idx = self._covs[class_idx].cpu()
                     cov_prime_idx = W.t() @ cov_idx @ W
@@ -704,7 +646,7 @@ class LwI(BaseLearner):
                     cov_prime += cov_prime_idx
                     Q_prime += cor_prime_idx
 
-                    # update stored per-class things on CPU
+                    # cập nhật lưu trữ trên CPU
                     self._covs[class_idx] = cov_prime_idx.cpu()
                     self._projectors[class_idx] = self.get_projector_svd(cov_prime_idx.cpu())
                     self._protos[class_idx] = (self._protos[class_idx].cpu() @ W).contiguous().cpu()
@@ -713,14 +655,12 @@ class LwI(BaseLearner):
                     safe_cuda_empty()
 
                 R_prime = cov_prime + (self.al_classifier.gamma * torch.eye(self.al_classifier.fe_size, device=self._cpu))
-                # update classifier accumulators on CPU
                 self.al_classifier.cov = (cov_prime + cov_new).cpu()
                 self.al_classifier.Q = (Q_prime + crs_cor_new).cpu()
                 self.al_classifier.R = (R_prime + cov_new).cpu()
 
                 R_inv = torch.inverse(self.al_classifier.R).to(self._cpu)
                 Delta = R_inv @ self.al_classifier.Q
-                # final fc weight normalized and moved to GPU
                 self.al_classifier.fc.weight = torch.nn.Parameter(F.normalize(Delta.t().float(), p=2, dim=-1).to(self._device))
 
                 safe_cuda_empty()
@@ -746,7 +686,7 @@ class LwI(BaseLearner):
 
     def _build_protos(self):
         """
-        Build protos/covs/projectors per class and keep them on CPU (to save GPU VRAM).
+        Build protos/covs/projectors per class và giữ trên CPU (tiết kiệm VRAM).
         """
         bs_local = min(64, self.args.get("batch_size", batch_size))
         for class_idx in range(self._known_classes, self._total_classes):
@@ -757,19 +697,23 @@ class LwI(BaseLearner):
                 shot=self.shot,
                 ret_data=True
             )
-            idx_loader = DataLoader(idx_dataset, batch_size=bs_local, shuffle=False, num_workers=0)
+            idx_loader = DataLoader(idx_dataset, batch_size=bs_local, shuffle=False, num_workers=0, pin_memory=True)
             fe = self.al_classifier.fe_size
             cov_sum = torch.zeros(fe, fe, device=self._cpu)
             proto_sum = torch.zeros(fe, device=self._cpu)
             count = 0
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 for _, (_, inputs, _) in enumerate(idx_loader):
                     inputs_cpu = inputs
-                    inputs_gpu = inputs_cpu.to(self._device)
-                    feats_gpu = self._network(inputs_gpu)["features"]
+                    inputs_gpu = inputs_cpu.to(self._device, non_blocking=True)
+                    if self._amp_enabled:
+                        with torch.cuda.amp.autocast(dtype=self._amp_dtype):
+                            feats_gpu = self._network(inputs_gpu)["features"]
+                    else:
+                        feats_gpu = self._network(inputs_gpu)["features"]
                     feats = feats_gpu.detach().cpu()
-                    del feats_gpu
+                    del feats_gpu, inputs_gpu
                     safe_cuda_empty()
 
                     cov_sum += feats.t() @ feats
@@ -813,17 +757,29 @@ class LwI(BaseLearner):
             losses = 0.0
             correct, total = 0, 0
             for _, (_, inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(self._device), targets.to(self._device)
-                logits = self._network(inputs)["logits"]
-                loss = F.cross_entropy(logits, targets)
-                optimizer.zero_grad()
-                loss.backward()
+                inputs, targets = inputs.to(self._device, non_blocking=True), targets.to(self._device, non_blocking=True)
+                if self._amp_enabled:
+                    with torch.cuda.amp.autocast(dtype=self._amp_dtype):
+                        logits = self._network(inputs)["logits"]
+                        loss = F.cross_entropy(logits, targets)
+                else:
+                    logits = self._network(inputs)["logits"]
+                    loss = F.cross_entropy(logits, targets)
+
+                optimizer.zero_grad(set_to_none=True)
+                if self._amp_enabled:
+                    loss.backward()
+                else:
+                    loss.backward()
                 optimizer.step()
                 losses += loss.item()
 
-                _, preds = torch.max(logits, dim=1)
-                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
-                total += len(targets)
+                with torch.no_grad():
+                    _, preds = torch.max(logits, dim=1)
+                    correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+                    total += len(targets)
+
+                del logits, preds, inputs, targets
                 safe_cuda_empty()
 
             scheduler.step()
@@ -845,8 +801,15 @@ class LwI(BaseLearner):
             losses = 0.0
             correct, total = 0, 0
             for _, (_, inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(self._device), targets.to(self._device)
-                logits = self._network(inputs)["logits"]
+                inputs, targets = inputs.to(self._device, non_blocking=True), targets.to(self._device, non_blocking=True)
+
+                if self._amp_enabled:
+                    with torch.cuda.amp.autocast(dtype=self._amp_dtype):
+                        outputs = self._network(inputs)
+                        logits = outputs["logits"]
+                else:
+                    outputs = self._network(inputs)
+                    logits = outputs["logits"]
 
                 fake_targets = targets - self._known_classes
                 loss_clf = F.cross_entropy(logits[:, self._known_classes:], fake_targets)
@@ -855,24 +818,24 @@ class LwI(BaseLearner):
                 loss_ot = torch.tensor(0.0, device=self._device, dtype=torch.float32)
 
                 if self._old_network is not None:
-                    # compute old_logits on CPU, then copy to GPU briefly for KD
+                    # compute old_logits on CPU, rồi đưa sang GPU cho KD
                     inputs_cpu = inputs.detach().cpu()
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         old_logits_cpu = self._old_network(inputs_cpu)["logits"].detach().cpu()
-                    # move old logits to GPU just for KD (small tensor: [batch, known_classes])
-                    old_logits_gpu = old_logits_cpu.to(self._device)
+                    old_logits_gpu = old_logits_cpu.to(self._device, non_blocking=True)
                     loss_kd = _KD_loss(logits[:, :self._known_classes], old_logits_gpu, T)
                     del old_logits_cpu, old_logits_gpu
                     safe_cuda_empty()
 
-                    # OT alignment: run only if flag set (this often creates many temporaries)
+                    # optional OT alignment (cẩn thận bộ nhớ)
                     if self.do_ot_alignment:
                         try:
+                            from utils.ot_align import get_wassersteinized_layers_modularized  # nếu có
                             aligned_layers, _ = get_wassersteinized_layers_modularized(self.args, self._device,
                                                                                        [self._old_network, self._network])
                             for old_param, new_like in zip(self._old_network.parameters(), aligned_layers):
                                 if old_param.shape == new_like.shape:
-                                    loss_ot += F.mse_loss(old_param.to(self._device), new_like)
+                                    loss_ot += F.mse_loss(old_param.to(self._device, non_blocking=True), new_like)
                             del aligned_layers
                         except Exception as e:
                             logging.warning(f"[OT] skipped due to: {e}")
@@ -881,7 +844,7 @@ class LwI(BaseLearner):
 
                 loss = lamda * loss_kd + loss_clf + 0.1 * loss_ot
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
                 losses += loss.item()
@@ -891,6 +854,7 @@ class LwI(BaseLearner):
                     correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                     total += len(targets)
 
+                del outputs, logits, preds, inputs, targets
                 safe_cuda_empty()
 
             scheduler.step()
