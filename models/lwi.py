@@ -8,6 +8,7 @@ from tqdm import tqdm
 from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler
 from utils.inc_net import IncrementalNet, CosineIncrementalNet, Drift_Estimator, ALClassifier
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
