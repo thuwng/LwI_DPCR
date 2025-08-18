@@ -175,73 +175,134 @@ class LwI(BaseLearner):
 
     # ---------------- weight similarity (CPU, blockwise) ----------------
     @torch.no_grad()
-    def _compute_similarity(self, W_old, W_new, batch_size=512, use_cpu=True):
+    def _compute_similarity(self, W_old, W_new, batch_size=256, use_cpu=True):  # Giảm batch_size từ 512 xuống 256
         import numpy as _np
         import os
+        import psutil
 
+        logging.info("[DEBUG] [Similarity] Starting _compute_similarity")
         # Đảm bảo ma trận trên CPU và contiguous
-        W_old_2d = W_old.view(W_old.size(0), -1).float().cpu().contiguous()
-        W_new_2d = W_new.view(W_new.size(0), -1).float().cpu().contiguous()
+        try:
+            W_old_2d = W_old.view(W_old.size(0), -1).float().cpu().contiguous()
+            W_new_2d = W_new.view(W_new.size(0), -1).float().cpu().contiguous()
+            logging.info(f"[DEBUG] [Similarity] Weights reshaped: W_old_2d.shape={W_old_2d.shape}, W_new_2d.shape={W_new_2d.shape}")
+        except Exception as e:
+            logging.error(f"[ERROR] [Similarity] Failed to reshape weights: {str(e)}")
+            logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
+            raise
 
         # Ghi log thông tin layer
         layer_debug = getattr(self, "_last_fuse_layer", None)
         if layer_debug is not None:
             self._log_layer_info(layer_debug, W_old_2d, W_new_2d)
+            logging.info(f"[DEBUG] [Similarity] Logged layer info for layer {layer_debug}")
+
+        # Kiểm tra shape bất thường
+        if W_old_2d.shape[1] == 1 or W_new_2d.shape[1] == 1:
+            logging.warning(f"[DEBUG] [Similarity] Unusual feature dimension (1) detected: W_old_2d.shape={W_old_2d.shape}, W_new_2d.shape={W_new_2d.shape}")
+            logging.info("[DEBUG] [Similarity] Attempting direct computation in RAM due to unusual shape")
+            try:
+                W_old_norm = F.normalize(W_old_2d, p=2, dim=1)
+                W_new_norm = F.normalize(W_new_2d, p=2, dim=1)
+                R = W_old_norm @ W_new_norm.t()
+                logging.info("[DEBUG] [Similarity] Direct computation completed, R shape={R.shape}")
+                return R.cpu().numpy()
+            except Exception as e:
+                logging.error(f"[ERROR] [Similarity] Failed direct computation: {str(e)}")
+                logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
+                raise
 
         # Chuẩn hóa ma trận
-        W_old_norm = F.normalize(W_old_2d, p=2, dim=1)
-        W_new_norm = F.normalize(W_new_2d, p=2, dim=1)
+        logging.info("[DEBUG] [Similarity] Starting normalization")
+        try:
+            W_old_norm = F.normalize(W_old_2d, p=2, dim=1)
+            W_new_norm = F.normalize(W_new_2d, p=2, dim=1)
+            logging.info("[DEBUG] [Similarity] Weights normalized")
+        except Exception as e:
+            logging.error(f"[ERROR] [Similarity] Failed to normalize weights: {str(e)}")
+            logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
+            raise
 
         n_old, n_new = W_old_norm.size(0), W_new_norm.size(0)
-        if self.debug_mode:
-            matrix_size_bytes = n_old * n_new * 4
-            matrix_size_gb = matrix_size_bytes / (1024 ** 3)
-            logging.info(f"[Similarity] n_old={n_old}, n_new={n_new}, R_shape={(n_old, n_new)}, Estimated R size: {matrix_size_gb:.2f} GB")
-            disk_usage = psutil.disk_usage('/kaggle/working' if os.path.exists('/kaggle/working') else '/tmp')
-            logging.info(f"[Disk] Free space: {disk_usage.free / (1024 ** 3):.2f} GB, Total: {disk_usage.total / (1024 ** 3):.2f} GB")
+        matrix_size_bytes = n_old * n_new * 4
+        matrix_size_gb = matrix_size_bytes / (1024 ** 3)
+        logging.info(f"[DEBUG] [Similarity] n_old={n_old}, n_new={n_new}, R_shape={(n_old, n_new)}, Estimated R size: {matrix_size_gb:.2f} GB")
 
-        # Nếu ma trận nhỏ, tính trực tiếp trong RAM để tránh I/O
-        if min(n_old, n_new) < 10:
-            logging.info("[Similarity] Small matrix detected, computing directly in RAM")
-            R = W_old_norm @ W_new_norm.t()
-            return R.cpu().numpy()
-
-        # Sử dụng /kaggle/working nếu có, ngược lại /tmp
+        # Kiểm tra dung lượng đĩa
         tmpdir = "/kaggle/working" if os.path.exists("/kaggle/working") else "/tmp"
-        if not os.path.exists(tmpdir):
-            os.makedirs(tmpdir, exist_ok=True)
+        try:
+            disk_usage = psutil.disk_usage(tmpdir)
+            logging.info(f"[DEBUG] [Similarity] Disk usage at {tmpdir}: Free={disk_usage.free / (1024 ** 3):.2f} GB, Total={disk_usage.total / (1024 ** 3):.2f} GB")
+            if matrix_size_gb > disk_usage.free / (1024 ** 3):
+                logging.error(f"[ERROR] [Similarity] Insufficient disk space for memmap: Required {matrix_size_gb:.2f} GB, Available {disk_usage.free / (1024 ** 3):.2f} GB")
+                raise RuntimeError("Insufficient disk space for memmap")
+        except Exception as e:
+            logging.error(f"[ERROR] [Similarity] Failed to check disk usage at {tmpdir}: {str(e)}")
+            logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
+            raise
+
+        # Nếu ma trận nhỏ, tính trực tiếp trong RAM
+        if min(n_old, n_new) < 100:  # Tăng ngưỡng từ 10 lên 100 để tránh memmap cho ma trận nhỏ
+            logging.info("[DEBUG] [Similarity] Small matrix detected, computing directly in RAM")
+            try:
+                R = W_old_norm @ W_new_norm.t()
+                logging.info("[DEBUG] [Similarity] Small matrix R computed, shape={R.shape}")
+                return R.cpu().numpy()
+            except Exception as e:
+                logging.error(f"[ERROR] [Similarity] Failed to compute small matrix R: {str(e)}")
+                logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
+                raise
+
+        # Tạo file memmap
+        logging.info(f"[DEBUG] [Similarity] Using tmpdir: {tmpdir}")
+        try:
+            if not os.path.exists(tmpdir):
+                logging.info(f"[DEBUG] [Similarity] Creating directory: {tmpdir}")
+                os.makedirs(tmpdir, exist_ok=True)
+        except Exception as e:
+            logging.error(f"[ERROR] [Similarity] Failed to create directory {tmpdir}: {str(e)}")
+            logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
+            raise
         fname = os.path.join(tmpdir, f"similarity_R_{os.getpid()}_{int(torch.randint(0, int(1e9), (1,)).item())}.dat")
+        logging.info(f"[DEBUG] [Similarity] Memmap file path: {fname}")
 
         R_memmap = None
         try:
-            if self.debug_mode:
-                logging.info(f"[Similarity] Creating memmap file: {fname}")
+            logging.info(f"[DEBUG] [Similarity] Creating memmap file: {fname}")
             R_memmap = _np.memmap(fname, dtype='float32', mode='w+', shape=(n_old, n_new))
-
+            logging.info(f"[DEBUG] [Similarity] Memmap file created: {fname}")
             W_new_np = W_new_norm.numpy()
             for start in range(0, n_old, batch_size):
                 end = min(start + batch_size, n_old)
-                if self.debug_mode:
-                    logging.info(f"[Similarity] Processing batch {start}:{end} of {n_old}")
-                block_old = W_old_norm[start:end].numpy()
-                block_sim = block_old.dot(W_new_np.T)
-                R_memmap[start:end, :] = block_sim.astype('float32')
-                R_memmap.flush()
-                del block_old, block_sim
+                logging.info(f"[DEBUG] [Similarity] Processing batch {start}:{end} of {n_old}")
+                try:
+                    block_old = W_old_norm[start:end].numpy()
+                    block_sim = block_old.dot(W_new_np.T)
+                    R_memmap[start:end, :] = block_sim.astype('float32')
+                    R_memmap.flush()
+                    logging.info(f"[DEBUG] [Similarity] Batch {start}:{end} computed and written to memmap")
+                    del block_old, block_sim
+                except Exception as e:
+                    logging.error(f"[ERROR] [Similarity] Failed to process batch {start}:{end}: {str(e)}")
+                    logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
+                    raise
+            logging.info(f"[DEBUG] [Similarity] Memmap computation completed")
             return R_memmap
         except Exception as e:
-            logging.error(f"[Similarity] Error in _compute_similarity: {e}")
-            logging.error(f"[Similarity] Traceback: {traceback.format_exc()}")
-            # nếu fail, cố gắng xoá file
-            try:
-                if R_memmap is not None and hasattr(R_memmap, 'filename') and os.path.exists(R_memmap.filename):
-                    os.remove(R_memmap.filename)
-            except Exception:
-                pass
+            logging.error(f"[ERROR] [Similarity] Error in _compute_similarity: {str(e)}")
+            logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
             raise
         finally:
+            if R_memmap is not None and hasattr(R_memmap, 'filename') and os.path.exists(R_memmap.filename):
+                try:
+                    file_size = os.path.getsize(R_memmap.filename) / (1024 ** 3)
+                    logging.info(f"[DEBUG] [Similarity] Removing memmap file: {R_memmap.filename}, size={file_size:.2f} GB")
+                    os.remove(R_memmap.filename)
+                except Exception as e:
+                    logging.warning(f"[DEBUG] [Similarity] Failed to remove memmap file {R_memmap.filename}: {str(e)}")
             del W_old_norm, W_new_norm
             safe_cuda_empty()
+            logging.info("[DEBUG] [Similarity] Cleared memory after _compute_similarity")
 
     # ---------------- weight fusion ----------------
     @torch.no_grad()
@@ -369,18 +430,30 @@ class LwI(BaseLearner):
             logging.info(f"[DEBUG] [Fuse] Final disk usage: Free={disk_usage.free / (1024 ** 3):.2f} GB, Total={disk_usage.total / (1024 ** 3):.2f} GB")
 
     def _flatten_out_first(self, W):
-        if W.dim() == 2:
-            shape = W.shape
-            return W, shape
-        elif W.dim() >= 3:
-            n_out = W.shape[0]
-            orig_shape = (n_out, *W.shape[1:])
-            return W.view(n_out, -1), orig_shape
-        elif W.dim() == 1:
-            n_out = W.shape[0]
-            return W.view(n_out, 1), (n_out,)
-        else:
-            raise ValueError(f"Unsupported weight dim: {W.shape}")
+        logging.info(f"[DEBUG] [Flatten] Input weight shape: {W.shape}")
+        try:
+            if W.dim() == 2:
+                shape = W.shape
+                logging.info(f"[DEBUG] [Flatten] Output shape: {shape}")
+                return W, shape
+            elif W.dim() >= 3:
+                n_out = W.shape[0]
+                orig_shape = (n_out, *W.shape[1:])
+                flattened = W.view(n_out, -1)
+                logging.info(f"[DEBUG] [Flatten] Flattened to shape: {flattened.shape}, original shape: {orig_shape}")
+                return flattened, orig_shape
+            elif W.dim() == 1:
+                n_out = W.shape[0]
+                flattened = W.view(n_out, 1)
+                logging.info(f"[DEBUG] [Flatten] Flattened to shape: {flattened.shape}")
+                return flattened, (n_out,)
+            else:
+                logging.error(f"[ERROR] [Flatten] Unsupported weight dim: {W.shape}")
+                raise ValueError(f"Unsupported weight dim: {W.shape}")
+        except Exception as e:
+            logging.error(f"[ERROR] [Flatten] Failed to flatten weights: {str(e)}")
+            logging.error(f"[ERROR] [Flatten] Traceback: {traceback.format_exc()}")
+            raise
 
     def _log_layer_info(self, layer, W_old_2d, W_new_2d):
         try:
