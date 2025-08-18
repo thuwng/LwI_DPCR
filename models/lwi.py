@@ -528,7 +528,7 @@ class LwI(BaseLearner):
                     inputs_gpu = inputs_cpu.to(self._device, non_blocking=True)
                     # AMP reduce VRAM
                     if self._amp_enabled and torch.cuda.is_available():
-                        with torch.amp.autocast("cuda", dtype=self._amp_dtype):
+                        with torch.amp.autocast(device_type="cuda", dtype=self._amp_dtype):
                             out_backbone = self._network(inputs_gpu)["features"]
                     else:
                         out_backbone = self._network(inputs_gpu)["features"]
@@ -600,7 +600,7 @@ class LwI(BaseLearner):
                         inputs_cpu = inputs
                         inputs_gpu = inputs_cpu.to(self._device, non_blocking=True)
                         if self._amp_enabled and torch.cuda.is_available():
-                            with torch.cuda.amp.autocast("cuda", dtype=self._amp_dtype):
+                            with torch.amp.autocast(device_type="cuda", dtype=self._amp_dtype):
                                 feats_new_gpu = self._network(inputs_gpu)["features"]
                         else:
                             feats_new_gpu = self._network(inputs_gpu)["features"]
@@ -709,7 +709,7 @@ class LwI(BaseLearner):
                     inputs_cpu = inputs
                     inputs_gpu = inputs_cpu.to(self._device, non_blocking=True)
                     if self._amp_enabled and torch.cuda.is_available():
-                        with torch.cuda.amp.autocast("cuda", dtype=self._amp_dtype):
+                        with torch.amp.autocast(device_type="cuda", dtype=self._amp_dtype):
                             feats_gpu = self._network(inputs_gpu)["features"]
                     else:
                         feats_gpu = self._network(inputs_gpu)["features"]
@@ -759,8 +759,8 @@ class LwI(BaseLearner):
             correct, total = 0, 0
             for _, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device, non_blocking=True), targets.to(self._device, non_blocking=True)
-                if self._amp_enabled:
-                    with torch.cuda.amp.autocast(dtype=self._amp_dtype):
+                if self._amp_enabled and torch.cuda.is_available():
+                    with torch.amp.autocast(device_type="cuda", dtype=self._amp_dtype):
                         logits = self._network(inputs)["logits"]
                         loss = F.cross_entropy(logits, targets)
                 else:
@@ -804,8 +804,8 @@ class LwI(BaseLearner):
             for _, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device, non_blocking=True), targets.to(self._device, non_blocking=True)
 
-                if self._amp_enabled:
-                    with torch.cuda.amp.autocast(dtype=self._amp_dtype):
+                if self._amp_enabled and torch.cuda.is_available():
+                    with torch.amp.autocast(device_type="cuda", dtype=self._amp_dtype):
                         outputs = self._network(inputs)
                         logits = outputs["logits"]
                 else:
