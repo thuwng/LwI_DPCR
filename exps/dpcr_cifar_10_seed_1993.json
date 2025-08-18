@@ -16,5 +16,8 @@
     "model_dir": "save_model/cifar100/dpcr_cifar_10_seed_1993/",
     "DPCR": true,
     "rg": 200,
-    "rg_tssp": 1e-9
+    "rg_tssp": 1e-9,
+    "lwi_mu": 1.0,
+    "lwi_use_kd": true
+
 }
