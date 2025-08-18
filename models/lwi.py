@@ -59,6 +59,15 @@ def _KD_loss(pred, soft, T):
     soft = torch.softmax(soft / T, dim=1)
     return -1 * torch.mul(soft, pred).sum() / pred.shape[0]
 
+# Thiết lập logging để ghi ra console và file
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('debug.log'),  # Ghi log ra file
+        logging.StreamHandler()  # In log ra console
+    ]
+)
 
 # ---------------- main class ----------------
 class LwI(BaseLearner):
