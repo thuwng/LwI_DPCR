@@ -175,7 +175,7 @@ class LwI(BaseLearner):
 
     # ---------------- weight similarity (CPU, blockwise) ----------------
     @torch.no_grad()
-    def _compute_similarity(self, W_old, W_new, batch_size=128, use_cpu=True):  # Giảm batch_size xuống 128
+    def _compute_similarity(self, W_old, W_new, batch_size=128, use_cpu=True):
         import numpy as _np
         import os
         import psutil
@@ -191,21 +191,24 @@ class LwI(BaseLearner):
             logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
             raise
 
+        # Gán n_old và n_new ngay từ đầu dựa trên shape sau reshape
+        n_old = W_old_2d.size(0)
+        n_new = W_new_2d.size(0)
+        logging.info(f"[DEBUG] [Similarity] Initial sizes: n_old={n_old}, n_new={n_new}")
+
         # Ghi log thông tin layer
         layer_debug = getattr(self, "_last_fuse_layer", None)
         if layer_debug is not None:
             self._log_layer_info(layer_debug, W_old_2d, W_new_2d)
             logging.info(f"[DEBUG] [Similarity] Logged layer info for layer {layer_debug}")
 
-        # Kiểm tra shape bất thường và giảm kích thước nếu cần
+        # Kiểm tra shape bất thường và xử lý trực tiếp nếu cần
         if W_old_2d.shape[1] <= 1 or W_new_2d.shape[1] <= 1:
             logging.warning(f"[DEBUG] [Similarity] Unusual feature dimension (<=1) detected: W_old_2d.shape={W_old_2d.shape}, W_new_2d.shape={W_new_2d.shape}")
-            logging.info("[DEBUG] [Similarity] Skipping memmap, attempting direct computation in RAM")
+            logging.info("[DEBUG] [Similarity] Computing R directly in RAM with batching")
             try:
                 W_old_norm = F.normalize(W_old_2d, p=2, dim=1)
                 W_new_norm = F.normalize(W_new_2d, p=2, dim=1)
-                # Chia nhỏ để giảm RAM
-                n_old, _ = W_old_norm.shape
                 R = torch.zeros(n_old, n_new, device=self._cpu)
                 for i in range(0, n_old, batch_size):
                     end = min(i + batch_size, n_old)
@@ -228,7 +231,6 @@ class LwI(BaseLearner):
             logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
             raise
 
-        n_old, n_new = W_old_norm.size(0), W_new_norm.size(0)
         matrix_size_bytes = n_old * n_new * 4
         matrix_size_gb = matrix_size_bytes / (1024 ** 3)
         logging.info(f"[DEBUG] [Similarity] n_old={n_old}, n_new={n_new}, R_shape={(n_old, n_new)}, Estimated R size: {matrix_size_gb:.2f} GB")
