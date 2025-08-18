@@ -69,6 +69,13 @@ class LwF(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
         self.args = args
+
+        # LwI-related hyperparams (can be put in json)
+        # lwi_mu: coefficient for info-preservation (MSE on features)
+        # lwi_use_kd: whether still keep KD loss (True default). If False -> remove KD.
+        self.lwi_mu = self.args.get("lwi_mu", 1.0)
+        self.lwi_use_kd = self.args.get("lwi_use_kd", True)
+
         if self.args["dataset"] == "imagenet100" or self.args["dataset"] == "imagenet1000":
             epochs = 100
             lrate = 0.05
@@ -295,8 +302,6 @@ class LwF(BaseLearner):
 
 
 
-
-
     # SVD for calculating the W_c
     def get_projector_svd(self, raw_matrix, all_non_zeros=True):
         V, S, VT = torch.svd(raw_matrix)
@@ -378,19 +383,45 @@ class LwF(BaseLearner):
             correct, total = 0, 0
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)
-                logits = self._network(inputs)["logits"]
+
+                # Forward new network
+                outputs_new = self._network(inputs)
+                logits = outputs_new["logits"]
+                feats_new = outputs_new.get("features", None)
 
                 fake_targets = targets - self._known_classes
                 loss_clf = F.cross_entropy(
                     logits[:, self._known_classes :], fake_targets
                 )
-                loss_kd = _KD_loss(
-                    logits[:, : self._known_classes],
-                    self._old_network(inputs)["logits"],
-                    T,
-                )
 
-                loss = lamda * loss_kd + loss_clf
+                # If old network exists, compute KD and Info losses
+                loss_kd = 0.0
+                loss_info = 0.0
+                if (hasattr(self, "_old_network") and self._old_network is not None):
+                    # ensure old_network in eval and no grad
+                    self._old_network.eval()
+                    with torch.no_grad():
+                        outputs_old = self._old_network(inputs)
+                        logits_old = outputs_old["logits"]
+                        feats_old = outputs_old.get("features", None)
+
+                    # KD loss (LwF style)
+                    if self.lwi_use_kd:
+                        loss_kd = _KD_loss(
+                            logits[:, : self._known_classes],
+                            logits_old,
+                            T,
+                        )
+                    else:
+                        loss_kd = 0.0
+
+                    # Info-preservation loss: MSE between feature vectors (if available)
+                    if (feats_new is not None) and (feats_old is not None):
+                        # detach old features (should be already detached under no_grad)
+                        loss_info = F.mse_loss(feats_new, feats_old.detach())
+
+                # Total loss: classification + lamda*KD + lwi_mu*info
+                loss = lamda * loss_kd + loss_clf + (self.lwi_mu * loss_info)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -429,4 +460,3 @@ def _KD_loss(pred, soft, T):
     pred = torch.log_softmax(pred / T, dim=1)
     soft = torch.softmax(soft / T, dim=1)
     return -1 * torch.mul(soft, pred).sum() / pred.shape[0]
-
