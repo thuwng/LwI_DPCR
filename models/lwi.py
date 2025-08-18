@@ -176,7 +176,7 @@ class LwI(BaseLearner):
 
     # ---------------- weight similarity (CPU, blockwise) ----------------
     @torch.no_grad()
-    def _compute_similarity(self, W_old, W_new, batch_size=128, use_cpu=True):
+    def _compute_similarity(self, W_old, W_new, batch_size=64, use_cpu=True):  # Reduced batch_size to 64
         import numpy as _np
         import os
         import psutil
@@ -203,6 +203,11 @@ class LwI(BaseLearner):
             self._log_layer_info(layer_debug, W_old_2d, W_new_2d)
             logging.info(f"[DEBUG] [Similarity] Logged layer info for layer {layer_debug}")
 
+        # Skip if dimensions too large to avoid OOM
+        if n_old > 10000 or n_new > 10000 or W_old_2d.shape[1] > 10000:
+            logging.warning(f"[DEBUG] [Similarity] Skipping large dimensions to avoid OOM: n_old={n_old}, n_new={n_new}, feat={W_old_2d.shape[1]}")
+            return np.eye(n_old, n_new)  # Return identity matrix as fallback
+
         # Kiểm tra shape bất thường và xử lý trực tiếp nếu cần
         if W_old_2d.shape[1] <= 1 or W_new_2d.shape[1] <= 1:
             logging.warning(f"[DEBUG] [Similarity] Unusual feature dimension (<=1) detected: W_old_2d.shape={W_old_2d.shape}, W_new_2d.shape={W_new_2d.shape}")
@@ -210,7 +215,7 @@ class LwI(BaseLearner):
             try:
                 W_old_norm = F.normalize(W_old_2d, p=2, dim=1)
                 W_new_norm = F.normalize(W_new_2d, p=2, dim=1)
-                R = torch.zeros(n_old, n_new, device=self._cpu)
+                R = torch.zeros(n_old, n_new, device=self._cpu, dtype=torch.float16)  # Use float16
                 for i in range(0, n_old, batch_size):
                     end = min(i + batch_size, n_old)
                     R[i:end, :] = W_old_norm[i:end] @ W_new_norm.t()
@@ -232,7 +237,7 @@ class LwI(BaseLearner):
             logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
             raise
 
-        matrix_size_bytes = n_old * n_new * 4
+        matrix_size_bytes = n_old * n_new * 2  # float16: 2 bytes
         matrix_size_gb = matrix_size_bytes / (1024 ** 3)
         logging.info(f"[DEBUG] [Similarity] n_old={n_old}, n_new={n_new}, R_shape={(n_old, n_new)}, Estimated R size: {matrix_size_gb:.2f} GB")
 
@@ -269,19 +274,19 @@ class LwI(BaseLearner):
         R_memmap = None
         try:
             logging.info(f"[DEBUG] [Similarity] Creating memmap file: {fname}")
-            R_memmap = _np.memmap(fname, dtype='float32', mode='w+', shape=(n_old, n_new))
+            R_memmap = _np.memmap(fname, dtype='float16', mode='w+', shape=(n_old, n_new))  # Use float16
             logging.info(f"[DEBUG] [Similarity] Memmap file created: {fname}")
-            W_new_np = W_new_norm.numpy()
+            W_new_np = W_new_norm.numpy().astype('float16')  # Cast to float16
             for start in range(0, n_old, batch_size):
                 end = min(start + batch_size, n_old)
                 logging.info(f"[DEBUG] [Similarity] Processing batch {start}:{end} of {n_old}")
                 try:
-                    block_old = W_old_norm[start:end].numpy()
+                    block_old = W_old_norm[start:end].numpy().astype('float16')
                     block_sim = block_old.dot(W_new_np.T)
-                    R_memmap[start:end, :] = block_sim.astype('float32')
+                    R_memmap[start:end, :] = block_sim.astype('float16')
                     R_memmap.flush()
-                    del block_old, block_sim  # Xóa ngay sau khi ghi
-                    safe_cuda_empty()  # Giải phóng bộ nhớ GPU (nếu có)
+                    del block_old, block_sim
+                    safe_cuda_empty()
                     logging.info(f"[DEBUG] [Similarity] Batch {start}:{end} computed and written to memmap")
                 except MemoryError as me:
                     logging.error(f"[ERROR] [Similarity] MemoryError in batch {start}:{end}: {str(me)}")
@@ -382,7 +387,7 @@ class LwI(BaseLearner):
             R = None
             try:
                 logging.info(f"[DEBUG] [Fuse] Starting similarity computation for layer {layer}")
-                R = self._compute_similarity(W_old_2d, W_new_2d, batch_size=128, use_cpu=True)
+                R = self._compute_similarity(W_old_2d, W_new_2d, batch_size=64, use_cpu=True)  # Reduced batch_size
                 logging.info(f"[DEBUG] [Fuse] Similarity matrix R computed for layer {layer}, shape={R.shape}")
 
                 logging.info(f"[DEBUG] [Fuse] Computing permutation matrix for layer {layer}")
@@ -474,7 +479,7 @@ class LwI(BaseLearner):
         best_vals = -1e9 * _np.ones((n_new,), dtype='float32')
         best_idxs = -1 * _np.ones((n_new,), dtype='int64')
 
-        BLOCK = 1024
+        BLOCK = 512  # Reduced BLOCK to 512 for less memory
         for start in range(0, n_old, BLOCK):
             end = min(start + BLOCK, n_old)
             logging.info(f"[DEBUG] [ApproxPerm] Processing batch {start}:{end} of {n_old} for layer {layer}")
@@ -840,7 +845,7 @@ class LwI(BaseLearner):
         """
         Build protos/covs/projectors per class và giữ trên CPU (tiết kiệm VRAM).
         """
-        bs_local = min(32, self.args.get("batch_size", batch_size))
+        bs_local = min(16, self.args.get("batch_size", batch_size))  # Reduced to 16
         for class_idx in range(self._known_classes, self._total_classes):
             data, targets, idx_dataset = self.data_manager.get_dataset(
                 np.arange(class_idx, class_idx + 1),
