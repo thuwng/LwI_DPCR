@@ -175,7 +175,7 @@ class LwI(BaseLearner):
 
     # ---------------- weight similarity (CPU, blockwise) ----------------
     @torch.no_grad()
-    def _compute_similarity(self, W_old, W_new, batch_size=256, use_cpu=True):  # Giảm batch_size từ 512 xuống 256
+    def _compute_similarity(self, W_old, W_new, batch_size=128, use_cpu=True):  # Giảm batch_size xuống 128
         import numpy as _np
         import os
         import psutil
@@ -197,15 +197,20 @@ class LwI(BaseLearner):
             self._log_layer_info(layer_debug, W_old_2d, W_new_2d)
             logging.info(f"[DEBUG] [Similarity] Logged layer info for layer {layer_debug}")
 
-        # Kiểm tra shape bất thường
-        if W_old_2d.shape[1] == 1 or W_new_2d.shape[1] == 1:
-            logging.warning(f"[DEBUG] [Similarity] Unusual feature dimension (1) detected: W_old_2d.shape={W_old_2d.shape}, W_new_2d.shape={W_new_2d.shape}")
-            logging.info("[DEBUG] [Similarity] Attempting direct computation in RAM due to unusual shape")
+        # Kiểm tra shape bất thường và giảm kích thước nếu cần
+        if W_old_2d.shape[1] <= 1 or W_new_2d.shape[1] <= 1:
+            logging.warning(f"[DEBUG] [Similarity] Unusual feature dimension (<=1) detected: W_old_2d.shape={W_old_2d.shape}, W_new_2d.shape={W_new_2d.shape}")
+            logging.info("[DEBUG] [Similarity] Skipping memmap, attempting direct computation in RAM")
             try:
                 W_old_norm = F.normalize(W_old_2d, p=2, dim=1)
                 W_new_norm = F.normalize(W_new_2d, p=2, dim=1)
-                R = W_old_norm @ W_new_norm.t()
-                logging.info("[DEBUG] [Similarity] Direct computation completed, R shape={R.shape}")
+                # Chia nhỏ để giảm RAM
+                n_old, _ = W_old_norm.shape
+                R = torch.zeros(n_old, n_new, device=self._cpu)
+                for i in range(0, n_old, batch_size):
+                    end = min(i + batch_size, n_old)
+                    R[i:end, :] = W_old_norm[i:end] @ W_new_norm.t()
+                logging.info(f"[DEBUG] [Similarity] Direct computation completed, R shape={R.shape}")
                 return R.cpu().numpy()
             except Exception as e:
                 logging.error(f"[ERROR] [Similarity] Failed direct computation: {str(e)}")
@@ -228,30 +233,22 @@ class LwI(BaseLearner):
         matrix_size_gb = matrix_size_bytes / (1024 ** 3)
         logging.info(f"[DEBUG] [Similarity] n_old={n_old}, n_new={n_new}, R_shape={(n_old, n_new)}, Estimated R size: {matrix_size_gb:.2f} GB")
 
-        # Kiểm tra dung lượng đĩa
+        # Kiểm tra dung lượng đĩa và RAM
         tmpdir = "/kaggle/working" if os.path.exists("/kaggle/working") else "/tmp"
         try:
             disk_usage = psutil.disk_usage(tmpdir)
+            ram_usage = psutil.virtual_memory()
             logging.info(f"[DEBUG] [Similarity] Disk usage at {tmpdir}: Free={disk_usage.free / (1024 ** 3):.2f} GB, Total={disk_usage.total / (1024 ** 3):.2f} GB")
+            logging.info(f"[DEBUG] [Similarity] RAM usage: Free={ram_usage.free / (1024 ** 3):.2f} GB, Total={ram_usage.total / (1024 ** 3):.2f} GB")
             if matrix_size_gb > disk_usage.free / (1024 ** 3):
                 logging.error(f"[ERROR] [Similarity] Insufficient disk space for memmap: Required {matrix_size_gb:.2f} GB, Available {disk_usage.free / (1024 ** 3):.2f} GB")
                 raise RuntimeError("Insufficient disk space for memmap")
+            if matrix_size_gb > ram_usage.free / (1024 ** 3):
+                logging.warning("[DEBUG] [Similarity] RAM may not be sufficient for direct computation, using memmap")
         except Exception as e:
-            logging.error(f"[ERROR] [Similarity] Failed to check disk usage at {tmpdir}: {str(e)}")
+            logging.error(f"[ERROR] [Similarity] Failed to check resources: {str(e)}")
             logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
             raise
-
-        # Nếu ma trận nhỏ, tính trực tiếp trong RAM
-        if min(n_old, n_new) < 100:  # Tăng ngưỡng từ 10 lên 100 để tránh memmap cho ma trận nhỏ
-            logging.info("[DEBUG] [Similarity] Small matrix detected, computing directly in RAM")
-            try:
-                R = W_old_norm @ W_new_norm.t()
-                logging.info("[DEBUG] [Similarity] Small matrix R computed, shape={R.shape}")
-                return R.cpu().numpy()
-            except Exception as e:
-                logging.error(f"[ERROR] [Similarity] Failed to compute small matrix R: {str(e)}")
-                logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
-                raise
 
         # Tạo file memmap
         logging.info(f"[DEBUG] [Similarity] Using tmpdir: {tmpdir}")
@@ -282,6 +279,10 @@ class LwI(BaseLearner):
                     R_memmap.flush()
                     logging.info(f"[DEBUG] [Similarity] Batch {start}:{end} computed and written to memmap")
                     del block_old, block_sim
+                except MemoryError as me:
+                    logging.error(f"[ERROR] [Similarity] MemoryError in batch {start}:{end}: {str(me)}")
+                    logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
+                    raise
                 except Exception as e:
                     logging.error(f"[ERROR] [Similarity] Failed to process batch {start}:{end}: {str(e)}")
                     logging.error(f"[ERROR] [Similarity] Traceback: {traceback.format_exc()}")
