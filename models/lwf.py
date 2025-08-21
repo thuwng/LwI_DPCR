@@ -243,7 +243,7 @@ class LwF(BaseLearner):
                     new_network = CosineIncrementalNet(self.args, False)
                 else:
                     new_network = IncrementalNet(self.args, False)
-                new_network.update_fc(self._total_classes)
+                new_network.update_fc(self._total_classes, self._cur_task)
                 new_network.to(self._device)
                 # Fuse with old network
                 self._fuse_with_old(new_network)
