@@ -427,7 +427,7 @@ class LwF(BaseLearner):
             prog_bar.set_description(info)
         logging.info(info)
 
-def _fuse_with_old(self, new_network):
+    def _fuse_with_old(self, new_network):
         old_state = self._old_network.state_dict()
         new_state = new_network.state_dict()
         fusion_k = 0.5  # Fusion coefficient k
