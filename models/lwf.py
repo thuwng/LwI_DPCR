@@ -15,7 +15,6 @@ from utils.toolkit import target2onehot, tensor2numpy
 from torchvision import datasets, transforms
 from utils.autoaugment import CIFAR10Policy
 
-
 init_epoch = 200
 init_lr = 0.1
 init_milestones = [60, 120, 160]
@@ -55,7 +54,6 @@ lamda = 10
 # T = 2
 # lamda = 5
 
-
 # fine-grained dataset
 # init_lr = 0.01
 # lrate = 0.005
@@ -75,6 +73,9 @@ class LwF(BaseLearner):
         # lwi_use_kd: whether still keep KD loss (True default). If False -> remove KD.
         self.lwi_mu = self.args.get("lwi_mu", 1.0)
         self.lwi_use_kd = self.args.get("lwi_use_kd", True)
+
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self._device}")
 
         if self.args["dataset"] == "imagenet100" or self.args["dataset"] == "imagenet1000":
             epochs = 100
@@ -104,9 +105,9 @@ class LwF(BaseLearner):
             lamda = 20
             self.num_per_class = 30
         if self.args["cosine"]:
-            self._network = CosineIncrementalNet(args, False)
+            self._network = CosineIncrementalNet(args, False).to(self._device)
         else:
-            self._network = IncrementalNet(args, False)
+            self._network = IncrementalNet(args, False).to(self._device)
 
         self._protos = []
         self.al_classifier = None
@@ -121,7 +122,8 @@ class LwF(BaseLearner):
             if not os.path.exists(self.args["model_dir"]):
                 os.makedirs(self.args["model_dir"])
             self.save_checkpoint("{}".format(self.args["model_dir"]))
-        # Tính train_acc và test_acc cuối cùng
+        # Đảm bảo network trên GPU
+        self._network = self._network.to(self._device)
         self._network.eval()
         correct_train, total_train = 0, 0
         with torch.no_grad():
@@ -138,7 +140,6 @@ class LwF(BaseLearner):
         # In ra kết quả cuối cùng
         print(f"Task {self._cur_task} - Final Train Accuracy: {train_acc_final:.2f}%")
         print(f"Task {self._cur_task} - Final Test Accuracy: {test_acc_final:.2f}%")
-        
 
     def incremental_train(self, data_manager):
         self.data_manager = data_manager
@@ -165,23 +166,19 @@ class LwF(BaseLearner):
                 transforms.ToTensor(),
                 transforms.ToPILImage()
             ]
-        self._total_classes = self._known_classes + data_manager.get_task_size(
-            self._cur_task
-        )
+        self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
         if self.args["cosine"]:
             self._network.update_fc(self._total_classes, self._cur_task)
         else:
             self._network.update_fc(self._total_classes)
 
-        if self.al_classifier == None:
-            self.al_classifier = ALClassifier(512, self._total_classes, 0, self._device,args=self.args).to(self._device)
+        if self.al_classifier is None:
+            self.al_classifier = ALClassifier(512, self._total_classes, 0, self._device, args=self.args).to(self._device)
             for name, param in self.al_classifier.named_parameters():
                 param.requires_grad = False
         else:
             self.al_classifier.augment_class(data_manager.get_task_size(self._cur_task))
-        logging.info(
-            "Learning on {}-{}".format(self._known_classes, self._total_classes)
-        )
+        print(f"Learning on {self._known_classes}-{self._total_classes}")
 
         self.shot = None
         train_dataset = data_manager.get_dataset(
@@ -190,7 +187,6 @@ class LwF(BaseLearner):
             mode="train",
             shot=self.shot
         )
-        # self.train_dataset = train_dataset
         self.train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
         )
@@ -211,9 +207,10 @@ class LwF(BaseLearner):
         resume = self.args['resume']
         if self._cur_task == 0:
             if resume:
-                print("Loading checkpoint: {}{}_model.pth.tar".format(self.args["model_dir"], self._total_classes))
-                self._network.load_state_dict(torch.load("{}{}_model.pth.tar".format(self.args["model_dir"], self._total_classes))["state_dict"], strict=False)
-            self._network.to(self._device)
+                print(f"Loading checkpoint: {self.args['model_dir']}{self._total_classes}_model.pth.tar")
+                state_dict = torch.load(f"{self.args['model_dir']}{self._total_classes}_model.pth.tar", map_location=self._device)["state_dict"]
+                self._network.load_state_dict(state_dict, strict=False)
+            self._network = self._network.to(self._device)
             if hasattr(self._network, "module"):
                 self._network_module_ptr = self._network.module
             if not resume:
@@ -222,9 +219,8 @@ class LwF(BaseLearner):
                 self._init_train(train_loader, test_loader, optimizer, scheduler)
 
             self._network.eval()
-            pbar = tqdm(enumerate(train_loader), desc='Analytic Learning Phase=' + str(self._cur_task),
-                             total=len(train_loader),
-                             unit='batch')
+            pbar = tqdm(enumerate(train_loader), desc=f'Analytic Learning Phase={self._cur_task}',
+                         total=len(train_loader), unit='batch')
             cov = torch.zeros(self.al_classifier.fe_size, self.al_classifier.fe_size).to(self._device)
             crs_cor = torch.zeros(self.al_classifier.fc.weight.size(1), self._total_classes).to(self._device)
             with torch.no_grad():
@@ -234,54 +230,46 @@ class LwF(BaseLearner):
                     out_fe, pred = self.al_classifier(out_backbone)
                     label_onehot = F.one_hot(targets, self._total_classes).float()
                     cov += torch.t(out_fe) @ out_fe
-                    crs_cor += torch.t(out_fe) @ (label_onehot)
+                    crs_cor += torch.t(out_fe) @ label_onehot
             self.al_classifier.cov = self.al_classifier.cov + cov
             self.al_classifier.R = self.al_classifier.R + cov
             self.al_classifier.Q = self.al_classifier.Q + crs_cor
             R_inv = torch.inverse(self.al_classifier.R.cpu()).to(self._device)
             Delta = R_inv @ self.al_classifier.Q
 
-            self.al_classifier.fc.weight = torch.nn.parameter.Parameter(
-                    F.normalize(torch.t(Delta.float()), p=2, dim=-1))
+            self.al_classifier.fc.weight = torch.nn.Parameter(F.normalize(torch.t(Delta.float()), p=2, dim=-1))
             self._build_protos()
         else:
-            resume = self.args['resume']
             if resume:
-                print("Loading checkpoint: {}{}_model.pth.tar".format(self.args["model_dir"], self._total_classes))
-                self._network.load_state_dict(torch.load("{}{}_model.pth.tar".format(self.args["model_dir"], self._total_classes))["state_dict"], strict=False)
-            self._network.to(self._device)
+                print(f"Loading checkpoint: {self.args['model_dir']}{self._total_classes}_model.pth.tar")
+                state_dict = torch.load(f"{self.args['model_dir']}{self._total_classes}_model.pth.tar", map_location=self._device)["state_dict"]
+                self._network.load_state_dict(state_dict, strict=False)
+            self._network = self._network.to(self._device)
             if hasattr(self._network, "module"):
                 self._network_module_ptr = self._network.module
             if self._old_network is not None:
-                self._old_network.to(self._device)
+                self._old_network = self._old_network.to(self._device)
             if not resume:
-                # Initialize new network for LwI
                 if self.args["cosine"]:
-                    new_network = CosineIncrementalNet(self.args, False)
+                    new_network = CosineIncrementalNet(self.args, False).to(self._device)
                 else:
-                    new_network = IncrementalNet(self.args, False)
+                    new_network = IncrementalNet(self.args, False).to(self._device)
                 new_network.update_fc(self._total_classes, self._cur_task)
-                new_network.to(self._device)
-                # Fuse with old network
                 self._fuse_with_old(new_network)
-                # Set fused network as current
-                self._network = new_network
+                self._network = new_network.to(self._device)
                 optimizer = optim.SGD(self._network.parameters(), lr=lrate, momentum=0.9, weight_decay=weight_decay)
                 scheduler = optim.lr_scheduler.MultiStepLR(optimizer=optimizer, milestones=milestones, gamma=lrate_decay)
                 self._update_representation(train_loader, test_loader, optimizer, scheduler)
-            self._build_protos()                
-                    
+            self._build_protos()
             if self.args["DPCR"]:
                 print('Using DPCR')
                 self._network.eval()
-                self.projector = Drift_Estimator(512, False, self.args)
-                self.projector.to(self._device)
+                self.projector = Drift_Estimator(512, False, self.args).to(self._device)
                 for name, param in self.projector.named_parameters():
                     param.requires_grad = False
                 self.projector.eval()
                 cov_pwdr = self.projector.rg_tssp * torch.eye(self.projector.fe_size).to(self._device)
                 crs_cor_pwdr = torch.zeros(self.projector.fe_size, self.projector.fe_size).to(self._device)
-
                 crs_cor_new = torch.zeros(self.al_classifier.fc.weight.size(1), self._total_classes).to(self._device)
                 cov_new = torch.zeros(self.projector.fe_size, self.projector.fe_size).to(self._device)
                 with torch.no_grad():
@@ -291,14 +279,14 @@ class LwF(BaseLearner):
                         feats_new = self._network(inputs)["features"]
                         cov_pwdr += torch.t(feats_old) @ feats_old
                         cov_new += torch.t(feats_new) @ feats_new
-                        crs_cor_pwdr += torch.t(feats_old) @ (feats_new)
+                        crs_cor_pwdr += torch.t(feats_old) @ feats_new
                         label_onehot = F.one_hot(targets, self._total_classes).float()
-                        crs_cor_new += torch.t(feats_new) @ (label_onehot)
+                        crs_cor_new += torch.t(feats_new) @ label_onehot
                 self.projector.cov = cov_pwdr
                 self.projector.Q = crs_cor_pwdr
                 R_inv = torch.inverse(cov_pwdr.cpu()).to(self._device)
                 Delta = R_inv @ crs_cor_pwdr
-                self.projector.fc.weight = torch.nn.parameter.Parameter(torch.t(Delta.float()))
+                self.projector.fc.weight = torch.nn.Parameter(torch.t(Delta.float()))
 
                 cov_prime = torch.zeros(self.al_classifier.fe_size, self.al_classifier.fe_size).to(self._device)
                 Q_prime = torch.zeros(self.al_classifier.fe_size, self.al_classifier.num_classes).to(self._device)
@@ -309,8 +297,7 @@ class LwF(BaseLearner):
                     cov_prime_idx = torch.t(W) @ cov_idx @ W
                     label = class_idx
                     label_onehot = F.one_hot(torch.tensor(label).long().to(self._device), self._total_classes).float()
-                    cor_prime_idx = self.num_per_class * (torch.t(W) @ torch.t(
-                        self._protos[class_idx].view(1, self.al_classifier.fe_size))) @ label_onehot.view(1, self._total_classes)
+                    cor_prime_idx = self.num_per_class * (torch.t(W) @ torch.t(self._protos[class_idx].view(1, self.al_classifier.fe_size))) @ label_onehot.view(1, self._total_classes)
                     cov_prime += cov_prime_idx
                     Q_prime += cor_prime_idx
                     self._covs[class_idx] = cov_prime_idx
@@ -323,18 +310,13 @@ class LwF(BaseLearner):
                 self.al_classifier.R = R_prime + cov_new
                 R_inv = torch.inverse(self.al_classifier.R.cpu()).to(self._device)
                 Delta = R_inv @ self.al_classifier.Q
-                self.al_classifier.fc.weight = torch.nn.parameter.Parameter(
-                        F.normalize(torch.t(Delta.float()), p=2, dim=-1))
+                self.al_classifier.fc.weight = torch.nn.Parameter(F.normalize(torch.t(Delta.float()), p=2, dim=-1))
 
-
-
-    # SVD for calculating the W_c
     def get_projector_svd(self, raw_matrix, all_non_zeros=True):
         V, S, VT = torch.svd(raw_matrix)
         if all_non_zeros:
             non_zeros_idx = torch.where(S > 0)[0]
             left_eign_vectors = V[:, non_zeros_idx]
-
         else:
             left_eign_vectors = V[:, :512]
         projector = left_eign_vectors @ torch.t(left_eign_vectors)
@@ -344,8 +326,8 @@ class LwF(BaseLearner):
         if self.args["DPCR"]:
             for class_idx in range(self._known_classes, self._total_classes):
                 data, targets, idx_dataset = self.data_manager.get_dataset(np.arange(class_idx, class_idx + 1),
-                                                                           source='train',
-                                                                           mode='test', shot=self.shot, ret_data=True)
+                                                                         source='train',
+                                                                         mode='test', shot=self.shot, ret_data=True)
                 idx_loader = DataLoader(idx_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
                 vectors, _ = self._extract_vectors(idx_loader)
                 class_mean = np.mean(vectors, axis=0)
@@ -353,7 +335,6 @@ class LwF(BaseLearner):
                 self._protos.append(torch.tensor(class_mean).to(self._device))
                 self._covs.append(torch.tensor(cov).to(self._device))
                 self._projectors.append(self.get_projector_svd(self._covs[class_idx]))
-
 
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
         prog_bar = tqdm(range(init_epoch))
@@ -364,41 +345,23 @@ class LwF(BaseLearner):
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)
                 logits = self._network(inputs)["logits"]
-
                 loss = F.cross_entropy(logits, targets)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 losses += loss.item()
-
                 _, preds = torch.max(logits, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
-
             scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-
             if epoch % 25 == 0:
                 test_acc = self._compute_accuracy(self._network, test_loader)
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
-                    self._cur_task,
-                    epoch + 1,
-                    init_epoch,
-                    losses / len(train_loader),
-                    train_acc,
-                    test_acc,
-                )
+                info = f"Task {self._cur_task}, Epoch {epoch + 1}/{init_epoch} => Loss {losses / len(train_loader):.3f}, Train_accy {train_acc:.2f}%, Test_accy {test_acc:.2f}%"
             else:
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
-                    self._cur_task,
-                    epoch + 1,
-                    init_epoch,
-                    losses / len(train_loader),
-                    train_acc,
-                )
+                info = f"Task {self._cur_task}, Epoch {epoch + 1}/{init_epoch} => Loss {losses / len(train_loader):.3f}, Train_accy {train_acc:.2f}%"
             prog_bar.set_description(info)
-
-        logging.info(info)
+        print(info)
 
     def _update_representation(self, train_loader, test_loader, optimizer, scheduler):
         prog_bar = tqdm(range(epochs))
@@ -409,40 +372,24 @@ class LwF(BaseLearner):
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)
                 logits = self._network(inputs)["logits"]
-
                 loss = F.cross_entropy(logits, targets)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 losses += loss.item()
-
                 with torch.no_grad():
                     _, preds = torch.max(logits, dim=1)
                     correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                     total += len(targets)
-
             scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
             if epoch % 25 == 0:
                 test_acc = self._compute_accuracy(self._network, test_loader)
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
-                    self._cur_task,
-                    epoch + 1,
-                    epochs,
-                    losses / len(train_loader),
-                    train_acc,
-                    test_acc,
-                )
+                info = f"Task {self._cur_task}, Epoch {epoch + 1}/{epochs} => Loss {losses / len(train_loader):.3f}, Train_accy {train_acc:.2f}%, Test_accy {test_acc:.2f}%"
             else:
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
-                    self._cur_task,
-                    epoch + 1,
-                    epochs,
-                    losses / len(train_loader),
-                    train_acc,
-                )
+                info = f"Task {self._cur_task}, Epoch {epoch + 1}/{epochs} => Loss {losses / len(train_loader):.3f}, Train_accy {train_acc:.2f}%"
             prog_bar.set_description(info)
-        logging.info(info)
+        print(info)
 
     def _fuse_with_old(self, new_network):
         old_state = self._old_network.state_dict()
@@ -456,13 +403,9 @@ class LwF(BaseLearner):
                 new_w = new_state[key]
                 if len(old_w.shape) not in [2, 4]:
                     continue
-
-                # Determine if shallow or deep layer
                 is_shallow = True
                 if 'layer3' in key or 'layer4' in key:
                     is_shallow = False
-
-                # Flatten for similarity
                 if len(old_w.shape) == 4:  # conv
                     C_out, C_in, kh, kw = old_w.shape
                     old_flat = old_w.view(C_out, -1)
@@ -471,37 +414,26 @@ class LwF(BaseLearner):
                     C_out, C_in = old_w.shape
                     old_flat = old_w.view(C_out, -1)
                     new_flat = new_w.view(C_out, -1)
-
-                # Compute cosine similarity R [C_out_old, C_out_new]
                 old_norm = old_flat.norm(dim=1, keepdim=True)
                 new_norm = new_flat.norm(dim=1, keepdim=True)
                 R = (old_flat @ new_flat.T) / (old_norm @ new_norm.T + EPSILON)
-
                 if not is_shallow:
-                    R = -R  # Minimize similarity for deep layers
-
-                # Greedy matching to get P [C_out_old, C_out_new]
+                    R = -R
                 R_copy = R.clone()
                 P = torch.zeros_like(R)
                 for _ in range(C_out):
                     val, idx = torch.max(R_copy.view(-1), 0)
                     if val == -inf:
                         break
-                    i = int(idx // C_out)  # old index
-                    j = int(idx % C_out)   # new index
+                    i = int(idx // C_out)
+                    j = int(idx % C_out)
                     P[i, j] = 1
                     R_copy[i, :] = -inf
                     R_copy[:, j] = -inf
-
-                # Align old_w using P: aligned_old_flat = P.T @ old_flat
                 aligned_old_flat = P.T @ old_flat
                 aligned_old_w = aligned_old_flat.view(old_w.shape)
-
-                # Fuse
                 fused_w = fusion_k * aligned_old_w + (1 - fusion_k) * new_w
                 new_state[key] = fused_w
-
-        # Load fused state
         new_network.load_state_dict(new_state)
 
 def _KD_loss(pred, soft, T):
