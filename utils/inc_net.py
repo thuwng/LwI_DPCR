@@ -181,17 +181,30 @@ class CosineIncrementalNet(BaseNet):
         super().__init__(args, pretrained)
         self.nb_proxy = nb_proxy
 
+    class CosineIncrementalNet(BaseNet):
+    def __init__(self, args, pretrained, nb_proxy=1):
+        super().__init__(args, pretrained)
+        self.nb_proxy = nb_proxy
+
     def update_fc(self, nb_classes, task_num):
         fc = self.generate_fc(self.feature_dim, nb_classes)
         if self.fc is not None:
-            if task_num == 1:
-                fc.fc1.weight.data = self.fc.weight.data
+            if isinstance(self.fc, CosineLinear):
+                # Trường hợp self.fc là CosineLinear
+                fc.weight.data = self.fc.weight.data
                 fc.sigma.data = self.fc.sigma.data
+            elif isinstance(self.fc, SplitCosineLinear):
+                # Trường hợp self.fc là SplitCosineLinear
+                if task_num == 1:
+                    fc.fc1.weight.data = self.fc.fc1.weight.data
+                    fc.sigma.data = self.fc.sigma.data
+                else:
+                    prev_out_features1 = self.fc.fc1.out_features
+                    fc.fc1.weight.data[:prev_out_features1] = self.fc.fc1.weight.data
+                    fc.fc1.weight.data[prev_out_features1:] = self.fc.fc2.weight.data
+                    fc.sigma.data = self.fc.sigma.data
             else:
-                prev_out_features1 = self.fc.fc1.out_features
-                fc.fc1.weight.data[:prev_out_features1] = self.fc.fc1.weight.data
-                fc.fc1.weight.data[prev_out_features1:] = self.fc.fc2.weight.data
-                fc.sigma.data = self.fc.sigma.data
+                raise ValueError("self.fc must be either CosineLinear or SplitCosineLinear")
 
         del self.fc
         self.fc = fc
