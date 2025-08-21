@@ -182,37 +182,53 @@ class CosineIncrementalNet(BaseNet):
         self.nb_proxy = nb_proxy
 
     def update_fc(self, nb_classes, task_num):
+        print(f"Starting update_fc with nb_classes={nb_classes}, task_num={task_num}")
+        print(f"Current self.fc type: {type(self.fc)}")
         fc = self.generate_fc(self.feature_dim, nb_classes)
+        print(f"Generated fc type: {type(fc)}")
         if self.fc is not None:
             if isinstance(self.fc, CosineLinear):
-                # Trường hợp self.fc là CosineLinear
-                fc.weight.data = self.fc.weight.data
-                fc.sigma.data = self.fc.sigma.data
-            elif isinstance(self.fc, SplitCosineLinear):
-                # Trường hợp self.fc là SplitCosineLinear
-                if task_num == 1:
-                    fc.fc1.weight.data = self.fc.fc1.weight.data
+                print("Processing CosineLinear case")
+                if isinstance(fc, CosineLinear):
+                    print("Copying weights from CosineLinear to CosineLinear")
+                    fc.weight.data = self.fc.weight.data
                     fc.sigma.data = self.fc.sigma.data
-                else:
+                elif isinstance(fc, SplitCosineLinear):
+                    print("Copying weights from CosineLinear to SplitCosineLinear")
+                    fc.fc1.weight.data = self.fc.weight.data
+                    fc.sigma.data = self.fc.sigma.data
+            elif isinstance(self.fc, SplitCosineLinear):
+                print("Processing SplitCosineLinear case")
+                if isinstance(fc, SplitCosineLinear):
+                    print("Copying weights from SplitCosineLinear to SplitCosineLinear")
                     prev_out_features1 = self.fc.fc1.out_features
+                    print(f"Previous out_features1: {prev_out_features1}")
                     fc.fc1.weight.data[:prev_out_features1] = self.fc.fc1.weight.data
                     fc.fc1.weight.data[prev_out_features1:] = self.fc.fc2.weight.data
                     fc.sigma.data = self.fc.sigma.data
+                else:
+                    raise ValueError("Cannot assign SplitCosineLinear weights to CosineLinear")
             else:
                 raise ValueError("self.fc must be either CosineLinear or SplitCosineLinear")
+        else:
+            print("self.fc is None, no weights to copy")
 
+        print("Deleting old fc and assigning new fc")
         del self.fc
         self.fc = fc
+        print(f"New fc type: {type(self.fc)}")
 
     def generate_fc(self, in_dim, out_dim):
+        print(f"Generating fc with in_dim={in_dim}, out_dim={out_dim}")
         if self.fc is None:
             fc = CosineLinear(in_dim, out_dim, self.nb_proxy, to_reduce=True)
+            print("Generated CosineLinear")
         else:
             prev_out_features = self.fc.out_features // self.nb_proxy
             fc = SplitCosineLinear(
                 in_dim, prev_out_features, out_dim - prev_out_features, self.nb_proxy
             )
-
+            print("Generated SplitCosineLinear")
         return fc
 
 
