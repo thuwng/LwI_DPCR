@@ -23,7 +23,7 @@ init_lr_decay = 0.1
 init_weight_decay = 0.0005
 
 # cifar100
-epochs = 100
+epochs = 2
 lrate = 0.05
 milestones = [45, 90]
 lrate_decay = 0.1
