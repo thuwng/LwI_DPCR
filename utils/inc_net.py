@@ -183,33 +183,29 @@ class CosineIncrementalNet(BaseNet):
 
     def update_fc(self, nb_classes, task_num):
         fc = self.generate_fc(self.feature_dim, nb_classes)
+
         if self.fc is not None:
-            prev_out_features = self.fc.out_features // self.nb_proxy  # Số lớp đầu ra trước đó
-            fc.sigma.data = self.fc.sigma.data  # Giữ sigma từ mô hình cũ
-            if task_num > 1 or (hasattr(self.fc, 'fc1') and hasattr(self.fc, 'fc2')):
-                # Xử lý SplitCosineLinear
-                if hasattr(self.fc, 'fc1') and hasattr(self.fc, 'fc2'):
-                    # Sao chép trọng số từ fc1
-                    fc.fc1.weight.data = self.fc.fc1.weight.data
-                    # Cập nhật fc2 cho các lớp mới nếu có
-                    if nb_classes > prev_out_features:
-                        new_fc2_size = (nb_classes - prev_out_features) * self.nb_proxy
-                        fc.fc2.weight.data = self.fc.fc2.weight.data.new_zeros((new_fc2_size, self.fc.fc2.weight.size(1)))
-                        nn.init.xavier_uniform_(fc.fc2.weight.data, gain=nn.init.calculate_gain('relu'))
-                else:
-                    # Trường hợp bất ngờ (nên hiếm khi xảy ra), sao chép trực tiếp nếu có weight
-                    if hasattr(self.fc, 'weight'):
-                        fc.weight.data = self.fc.weight.data
+            fc.sigma.data = self.fc.sigma.data
+
+            # Trường hợp CosineLinear (task đầu tiên)
+            if isinstance(self.fc, CosineLinear):
+                fc.weight.data[:self.fc.out_features] = self.fc.weight.data.clone()
+
+            # Trường hợp SplitCosineLinear (sau task 1)
+            elif isinstance(self.fc, SplitCosineLinear):
+                # copy lại phần fc1 (các lớp cũ)
+                fc.fc1.weight.data = self.fc.fc1.weight.data.clone()
+
+                # giữ nguyên fc2 cũ nếu có
+                if hasattr(self.fc, "fc2"):
+                    fc.fc2.weight.data = self.fc.fc2.weight.data.clone()
+
             else:
-                # Task đầu tiên hoặc CosineLinear, sao chép toàn bộ trọng số
-                if hasattr(self.fc, 'weight'):
-                    fc.weight.data = self.fc.weight.data
-                elif hasattr(self.fc, 'fc1'):
-                    fc.fc1.weight.data = self.fc.fc1.weight.data
-                    fc.sigma.data = self.fc.sigma.data
+                raise ValueError(f"Unsupported classifier type: {type(self.fc)}")
 
         del self.fc
         self.fc = fc
+
 
     def generate_fc(self, in_dim, out_dim):
         if self.fc is None:
