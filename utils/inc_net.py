@@ -191,17 +191,18 @@ class CosineIncrementalNet(BaseNet):
             if isinstance(self.fc, CosineLinear):
                 fc.weight.data[:self.fc.out_features] = self.fc.weight.data.clone()
 
-            # Trường hợp SplitCosineLinear (sau task 1)
+            if isinstance(self.fc, nn.Linear):
+                # Trường hợp task 0 -> task 1
+                fc.fc1.weight.data[:self.fc.out_features] = self.fc.weight.data.clone()
+
             elif isinstance(self.fc, SplitCosineLinear):
-                # copy lại phần fc1 (các lớp cũ)
-                fc.fc1.weight.data = self.fc.fc1.weight.data.clone()
-
-                # giữ nguyên fc2 cũ nếu có
-                if hasattr(self.fc, "fc2"):
-                    fc.fc2.weight.data = self.fc.fc2.weight.data.clone()
-
+                # Trường hợp từ task 1 trở đi
+                fc.fc1.weight.data[:self.fc.fc1.out_features] = self.fc.fc1.weight.data.clone()
+                if self.fc.fc2 is not None:
+                    fc.fc2.weight.data[:self.fc.fc2.out_features] = self.fc.fc2.weight.data.clone()
             else:
                 raise ValueError(f"Unsupported classifier type: {type(self.fc)}")
+
 
         del self.fc
         self.fc = fc
