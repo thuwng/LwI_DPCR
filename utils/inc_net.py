@@ -183,40 +183,15 @@ class CosineIncrementalNet(BaseNet):
 
     def update_fc(self, nb_classes, task_num):
         fc = self.generate_fc(self.feature_dim, nb_classes)
-
         if self.fc is not None:
-            fc.sigma.data = self.fc.sigma.data  # Giữ sigma từ mô hình cũ
-
-            # Xử lý dựa trên loại của self.fc
-            if isinstance(self.fc, CosineLinear):
-                # Task đầu tiên, sao chép toàn bộ trọng số từ CosineLinear
-                fc.weight.data[:self.fc.out_features] = self.fc.weight.data.clone()
-            
-            elif isinstance(self.fc, nn.Linear):
-                # Trường hợp từ task 0 sang task 1 (chuyển từ Linear sang SplitCosineLinear)
-                prev_out_features = self.fc.out_features
-                fc.fc1.weight.data[:prev_out_features] = self.fc.weight.data.clone()
-                if nb_classes > prev_out_features:
-                    new_fc2_size = (nb_classes - prev_out_features) * self.nb_proxy
-                    fc.fc2.weight.data = fc.fc2.weight.data.new_zeros((new_fc2_size, fc.fc2.weight.size(1)))
-                    nn.init.xavier_uniform_(fc.fc2.weight.data, gain=nn.init.calculate_gain('relu'))
-
-            elif isinstance(self.fc, SplitCosineLinear):
-                # Task 1 trở đi, sao chép từ SplitCosineLinear
-                prev_out_features = self.fc.fc1.out_features
-                fc.fc1.weight.data[:prev_out_features] = self.fc.fc1.weight.data.clone()
-                if nb_classes > (prev_out_features // self.nb_proxy):
-                    new_fc2_size = (nb_classes - (prev_out_features // self.nb_proxy)) * self.nb_proxy
-                    fc.fc2.weight.data[:self.fc.fc2.weight.size(0)] = self.fc.fc2.weight.data.clone()
-                    if new_fc2_size > self.fc.fc2.weight.size(0):
-                        additional_size = new_fc2_size - self.fc.fc2.weight.size(0)
-                        fc.fc2.weight.data = torch.cat([
-                            fc.fc2.weight.data,
-                            fc.fc2.weight.data.new_zeros((additional_size, fc.fc2.weight.size(1)))
-                        ], dim=0)
-                        nn.init.xavier_uniform_(fc.fc2.weight.data[self.fc.fc2.weight.size(0):], gain=nn.init.calculate_gain('relu'))
+            if task_num == 1:
+                fc.fc1.weight.data = self.fc.weight.data
+                fc.sigma.data = self.fc.sigma.data
             else:
-                raise ValueError(f"Unsupported classifier type: {type(self.fc)}")
+                prev_out_features1 = self.fc.fc1.out_features
+                fc.fc1.weight.data[:prev_out_features1] = self.fc.fc1.weight.data
+                fc.fc1.weight.data[prev_out_features1:] = self.fc.fc2.weight.data
+                fc.sigma.data = self.fc.sigma.data
 
         del self.fc
         self.fc = fc
