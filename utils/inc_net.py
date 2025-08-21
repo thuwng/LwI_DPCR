@@ -187,14 +187,23 @@ class CosineIncrementalNet(BaseNet):
             prev_out_features = self.fc.out_features // self.nb_proxy  # Số lớp đầu ra trước đó
             fc.sigma.data = self.fc.sigma.data  # Giữ sigma từ mô hình cũ
             if task_num > 1:
-                # Sao chép trọng số từ mô hình cũ cho các lớp đã có
-                fc.weight.data[:prev_out_features * self.nb_proxy] = self.fc.weight.data
-                # Khởi tạo trọng số cho các lớp mới (nếu có)
-                if nb_classes > prev_out_features:
-                    nn.init.xavier_uniform_(fc.weight.data[prev_out_features * self.nb_proxy:], gain=nn.init.calculate_gain('relu'))
+                # Xử lý SplitCosineLinear
+                if hasattr(self.fc, 'fc1') and hasattr(self.fc, 'fc2'):
+                    # Sao chép trọng số từ fc1 và fc2
+                    fc.fc1.weight.data = self.fc.fc1.weight.data
+                    if nb_classes > prev_out_features:
+                        fc.fc2.weight.data = self.fc.fc2.weight.data.new_zeros((nb_classes - prev_out_features) * self.nb_proxy, self.fc.fc2.weight.size(1))
+                        nn.init.xavier_uniform_(fc.fc2.weight.data, gain=nn.init.calculate_gain('relu'))
+                else:
+                    # Nếu không có fc1/fc2 (trường hợp CosineLinear), sao chép trực tiếp
+                    fc.weight.data = self.fc.weight.data
             else:
                 # Task đầu tiên, sao chép toàn bộ trọng số
-                fc.weight.data = self.fc.weight.data
+                if hasattr(self.fc, 'weight'):
+                    fc.weight.data = self.fc.weight.data
+                elif hasattr(self.fc, 'fc1'):
+                    fc.fc1.weight.data = self.fc.fc1.weight.data
+                    fc.sigma.data = self.fc.sigma.data
 
         del self.fc
         self.fc = fc
