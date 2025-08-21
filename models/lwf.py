@@ -191,7 +191,7 @@ class LwF(BaseLearner):
             self._network = self._network.module
 
     def _train(self, train_loader, test_loader):
-        resume = self.args['resume']  # set resume=True to use saved checkpoints
+        resume = self.args['resume']
         if self._cur_task == 0:
             if resume:
                 print("Loading checkpoint: {}{}_model.pth.tar".format(self.args["model_dir"], self._total_classes))
@@ -238,16 +238,26 @@ class LwF(BaseLearner):
             if self._old_network is not None:
                 self._old_network.to(self._device)
             if not resume:
+                # Initialize new network for LwI
+                if self.args["cosine"]:
+                    new_network = CosineIncrementalNet(self.args, False)
+                else:
+                    new_network = IncrementalNet(self.args, False)
+                new_network.update_fc(self._total_classes)
+                new_network.to(self._device)
+                # Fuse with old network
+                self._fuse_with_old(new_network)
+                # Set fused network as current
+                self._network = new_network
                 optimizer = optim.SGD(self._network.parameters(), lr=lrate, momentum=0.9, weight_decay=weight_decay)
                 scheduler = optim.lr_scheduler.MultiStepLR(optimizer=optimizer, milestones=milestones, gamma=lrate_decay)
                 self._update_representation(train_loader, test_loader, optimizer, scheduler)
             self._build_protos()                
                     
-                    
             if self.args["DPCR"]:
                 print('Using DPCR')
                 self._network.eval()
-                self.projector = Drift_Estimator(512,False,self.args)
+                self.projector = Drift_Estimator(512, False, self.args)
                 self.projector.to(self._device)
                 for name, param in self.projector.named_parameters():
                     param.requires_grad = False
@@ -261,7 +271,6 @@ class LwF(BaseLearner):
                     for i, (_, inputs, targets) in enumerate(train_loader):
                         inputs, targets = inputs.to(self._device), targets.to(self._device)
                         feats_old = self._old_network(inputs)["features"]
-                        # print(feats_old)
                         feats_new = self._network(inputs)["features"]
                         cov_pwdr += torch.t(feats_old) @ feats_old
                         cov_new += torch.t(feats_new) @ feats_new
@@ -294,7 +303,7 @@ class LwF(BaseLearner):
                 R_prime = cov_prime + self.al_classifier.gamma * torch.eye(self.al_classifier.fe_size).to(self._device)
                 self.al_classifier.cov = cov_prime + cov_new
                 self.al_classifier.Q = Q_prime + crs_cor_new
-                self.al_classifier.R = R_prime+ cov_new
+                self.al_classifier.R = R_prime + cov_new
                 R_inv = torch.inverse(self.al_classifier.R.cpu()).to(self._device)
                 Delta = R_inv @ self.al_classifier.Q
                 self.al_classifier.fc.weight = torch.nn.parameter.Parameter(
@@ -322,8 +331,8 @@ class LwF(BaseLearner):
                                                                            mode='test', shot=self.shot, ret_data=True)
                 idx_loader = DataLoader(idx_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
                 vectors, _ = self._extract_vectors(idx_loader)
-                class_mean = np.mean(vectors, axis=0)  # vectors.mean(0)
-                cov = np.dot(np.transpose(vectors),vectors)
+                class_mean = np.mean(vectors, axis=0)
+                cov = np.dot(np.transpose(vectors), vectors)
                 self._protos.append(torch.tensor(class_mean).to(self._device))
                 self._covs.append(torch.tensor(cov).to(self._device))
                 self._projectors.append(self.get_projector_svd(self._covs[class_idx]))
@@ -375,7 +384,6 @@ class LwF(BaseLearner):
         logging.info(info)
 
     def _update_representation(self, train_loader, test_loader, optimizer, scheduler):
-
         prog_bar = tqdm(range(epochs))
         for _, epoch in enumerate(prog_bar):
             self._network.train()
@@ -383,46 +391,9 @@ class LwF(BaseLearner):
             correct, total = 0, 0
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)
+                logits = self._network(inputs)["logits"]
 
-                # Forward new network
-                outputs_new = self._network(inputs)
-                logits = outputs_new["logits"]
-                feats_new = outputs_new.get("features", None)
-
-                fake_targets = targets - self._known_classes
-                loss_clf = F.cross_entropy(
-                    logits[:, self._known_classes :], fake_targets
-                )
-
-                # If old network exists, compute KD and Info losses
-                loss_kd = 0.0
-                loss_info = 0.0
-                if (hasattr(self, "_old_network") and self._old_network is not None):
-                    # ensure old_network in eval and no grad
-                    self._old_network.eval()
-                    with torch.no_grad():
-                        outputs_old = self._old_network(inputs)
-                        logits_old = outputs_old["logits"]
-                        feats_old = outputs_old.get("features", None)
-
-                    # KD loss (LwF style)
-                    if self.lwi_use_kd:
-                        loss_kd = _KD_loss(
-                            logits[:, : self._known_classes],
-                            logits_old,
-                            T,
-                        )
-                    else:
-                        loss_kd = 0.0
-
-                    # Info-preservation loss: MSE between feature vectors (if available)
-                    if (feats_new is not None) and (feats_old is not None):
-                        # detach old features (should be already detached under no_grad)
-                        loss_info = F.mse_loss(feats_new, feats_old.detach())
-
-                # Total loss: classification + lamda*KD + lwi_mu*info
-                loss = lamda * loss_kd + loss_clf + (self.lwi_mu * loss_info)
-
+                loss = F.cross_entropy(logits, targets)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -455,6 +426,66 @@ class LwF(BaseLearner):
                 )
             prog_bar.set_description(info)
         logging.info(info)
+
+def _fuse_with_old(self, new_network):
+        old_state = self._old_network.state_dict()
+        new_state = new_network.state_dict()
+        fusion_k = 0.5  # Fusion coefficient k
+        inf = 1e9  # For greedy matching
+
+        for key in new_state:
+            if 'weight' in key and ('conv' in key or 'linear' in key) and 'fc' not in key:
+                old_w = old_state[key]
+                new_w = new_state[key]
+                if len(old_w.shape) not in [2, 4]:
+                    continue
+
+                # Determine if shallow or deep layer
+                is_shallow = True
+                if 'layer3' in key or 'layer4' in key:
+                    is_shallow = False
+
+                # Flatten for similarity
+                if len(old_w.shape) == 4:  # conv
+                    C_out, C_in, kh, kw = old_w.shape
+                    old_flat = old_w.view(C_out, -1)
+                    new_flat = new_w.view(C_out, -1)
+                else:  # linear
+                    C_out, C_in = old_w.shape
+                    old_flat = old_w.view(C_out, -1)
+                    new_flat = new_w.view(C_out, -1)
+
+                # Compute cosine similarity R [C_out_old, C_out_new]
+                old_norm = old_flat.norm(dim=1, keepdim=True)
+                new_norm = new_flat.norm(dim=1, keepdim=True)
+                R = (old_flat @ new_flat.T) / (old_norm @ new_norm.T + EPSILON)
+
+                if not is_shallow:
+                    R = -R  # Minimize similarity for deep layers
+
+                # Greedy matching to get P [C_out_old, C_out_new]
+                R_copy = R.clone()
+                P = torch.zeros_like(R)
+                for _ in range(C_out):
+                    val, idx = torch.max(R_copy.view(-1), 0)
+                    if val == -inf:
+                        break
+                    i = int(idx // C_out)  # old index
+                    j = int(idx % C_out)   # new index
+                    P[i, j] = 1
+                    R_copy[i, :] = -inf
+                    R_copy[:, j] = -inf
+
+                # Align old_w using P: aligned_old_flat = P.T @ old_flat
+                aligned_old_flat = P.T @ old_flat
+                aligned_old_w = aligned_old_flat.view(old_w.shape)
+
+                # Fuse
+                fused_w = fusion_k * aligned_old_w + (1 - fusion_k) * new_w
+                new_state[key] = fused_w
+
+        # Load fused state
+        new_network.load_state_dict(new_state)
 
 def _KD_loss(pred, soft, T):
     pred = torch.log_softmax(pred / T, dim=1)
