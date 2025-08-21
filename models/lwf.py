@@ -121,6 +121,23 @@ class LwF(BaseLearner):
             if not os.path.exists(self.args["model_dir"]):
                 os.makedirs(self.args["model_dir"])
             self.save_checkpoint("{}".format(self.args["model_dir"]))
+        # Tính train_acc và test_acc cuối cùng
+        self._network.eval()
+        correct_train, total_train = 0, 0
+        with torch.no_grad():
+            for _, inputs, targets in self.train_loader:
+                inputs, targets = inputs.to(self._device), targets.to(self._device)
+                logits = self._network(inputs)["logits"]
+                _, preds = torch.max(logits, dim=1)
+                correct_train += preds.eq(targets.expand_as(preds)).cpu().sum()
+                total_train += len(targets)
+        train_acc_final = np.around(tensor2numpy(correct_train) * 100 / total_train, decimals=2)
+
+        test_acc_final = self._compute_accuracy(self._network, self.test_loader)
+
+        # In ra kết quả cuối cùng
+        print(f"Task {self._cur_task} - Final Train Accuracy: {train_acc_final:.2f}%")
+        print(f"Task {self._cur_task} - Final Test Accuracy: {test_acc_final:.2f}%")
         
 
     def incremental_train(self, data_manager):
