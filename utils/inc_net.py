@@ -181,11 +181,6 @@ class CosineIncrementalNet(BaseNet):
         super().__init__(args, pretrained)
         self.nb_proxy = nb_proxy
 
-    class CosineIncrementalNet(BaseNet):
-    def __init__(self, args, pretrained, nb_proxy=1):
-        super().__init__(args, pretrained)
-        self.nb_proxy = nb_proxy
-
     def update_fc(self, nb_classes, task_num):
         fc = self.generate_fc(self.feature_dim, nb_classes)
         if self.fc is not None:
