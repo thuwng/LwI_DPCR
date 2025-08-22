@@ -30,7 +30,7 @@ batch_size = 128
 weight_decay = 2e-4
 num_workers = 8
 T = 2
-lamda = 10
+lamda = 7 # giảm từ 10 thành 7 
 
 # Tiny-ImageNet200
 # epochs = 100
