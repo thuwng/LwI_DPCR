@@ -1,5 +1,4 @@
 import sys
-import logging
 import copy
 import torch
 from utils import factory
@@ -20,32 +19,13 @@ def train(args):
 
 def _train(args):
 
-    init_cls = 0 if args ["init_cls"] == args["increment"] else args["init_cls"]
-    logs_name = "logs/{}/{}/{}/{}".format(args["model_name"],args["dataset"], init_cls, args['increment'])
+    init_cls = 0 if args["init_cls"] == args["increment"] else args["init_cls"]
+    logs_name = "logs/{}/{}/{}/{}".format(args["model_name"], args["dataset"], init_cls, args['increment'])
     
     if not os.path.exists(logs_name):
         os.makedirs(logs_name)
 
-    logfilename = "logs/{}/{}/{}/{}/{}_{}_{}".format(
-        args["model_name"],
-        args["dataset"],
-        init_cls,
-        args["increment"],
-        args["prefix"],
-        args["seed"],
-        args["convnet_type"],
-    )
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(filename)s] => %(message)s",
-        handlers=[
-            logging.FileHandler(filename=logfilename + ".log"),
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
-
     _set_random(args["seed"])
-    #_set_random()
     _set_device(args)
     print_args(args)
     data_manager = DataManager(
@@ -61,34 +41,28 @@ def _train(args):
     if not os.path.exists(model.args["model_dir"]):
         os.makedirs(model.args["model_dir"])
 
-
     cnn_curve, nme_curve, maha_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}, {"top1": [], "top5": []}
     for task in range(data_manager.nb_tasks):
-        logging.info("All params: {}".format(count_parameters(model._network)))
-        logging.info(
-            "Trainable params: {}".format(count_parameters(model._network, True))
-        )
+        print("All params: {}".format(count_parameters(model._network)))
+        print("Trainable params: {}".format(count_parameters(model._network, True)))
         model.incremental_train(data_manager)
         cnn_accy, nme_accy = model.eval_task()
         model.after_task()
 
         if nme_accy is not None:
-            logging.info("CNN: {}".format(cnn_accy["grouped"]))
-            logging.info("NME: {}".format(nme_accy["grouped"]))
+            print("CNN: {}".format(cnn_accy["grouped"]))
+            print("NME: {}".format(nme_accy["grouped"]))
 
             cnn_curve["top1"].append(cnn_accy["top1"])
-
             nme_curve["top1"].append(nme_accy["top1"])
 
-            logging.info("CNN top1 curve: {}".format(cnn_curve["top1"]))
-            logging.info("NME top1 curve: {}".format(nme_curve["top1"]))
+            print("CNN top1 curve: {}".format(cnn_curve["top1"]))
+            print("NME top1 curve: {}".format(nme_curve["top1"]))
         else:
-            logging.info("No NME accuracy.")
-            logging.info("CNN: {}".format(cnn_accy["grouped"]))
-
+            print("No NME accuracy.")
+            print("CNN: {}".format(cnn_accy["grouped"]))
             cnn_curve["top1"].append(cnn_accy["top1"])
-
-            logging.info("CNN top1 curve: {}".format(cnn_curve["top1"]))
+            print("CNN top1 curve: {}".format(cnn_curve["top1"]))
 
 
 def _set_device(args):
@@ -116,4 +90,4 @@ def _set_random(seed):
 
 def print_args(args):
     for key, value in args.items():
-        logging.info("{}: {}".format(key, value))
+        print("{}: {}".format(key, value))
